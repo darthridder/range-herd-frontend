@@ -29,11 +29,15 @@ export default function App() {
   }, []);
 
   const handleLogin = (token: string, userData: any) => {
+    localStorage.setItem("token", token);
+    localStorage.setItem("user", JSON.stringify(userData));
     setUser(userData);
     setView("dashboard");
   };
 
   const handleRegister = (token: string, userData: any) => {
+    localStorage.setItem("token", token);
+    localStorage.setItem("user", JSON.stringify(userData));
     setUser(userData);
     setView("dashboard");
   };
