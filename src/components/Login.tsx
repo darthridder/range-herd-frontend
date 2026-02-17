@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { API_URL } from './config';
+import { API_URL } from '../config';
 
 type LoginProps = {
   onLogin: (token: string, user: any) => void;
