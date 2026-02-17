@@ -33,6 +33,7 @@ export default function GeofencePanel({ token, onGeofenceCreated, onGeofenceDele
       if (res.ok) {
         const data = await res.json();
         setGeofences(data);
+        onGeofenceCreated(); // notify parent that geofences are up-to-date
       }
     } catch (err) {
       console.error("Failed to load geofences:", err);
