@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { API_URL } from '../config';
 
 type RegisterProps = {
   onRegister: (token: string, user: any) => void;
@@ -25,7 +26,7 @@ export default function Register({ onRegister, onSwitchToLogin }: RegisterProps)
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/register", {
+      const res = await fetch(`${API_URL}/api/auth/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password, name, ranchName }),

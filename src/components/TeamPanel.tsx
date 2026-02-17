@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { API_URL } from '../config';
 
 type TeamMember = {
   id: string;
@@ -42,10 +43,10 @@ export default function TeamPanel({ token, currentUserId }: TeamPanelProps) {
     try {
       setLoading(true);
       const [membersRes, invitesRes] = await Promise.all([
-        fetch("/api/team/members", {
+        fetch(`${API_URL}/api/team/members`, {
           headers: { Authorization: `Bearer ${token}` },
         }),
-        fetch("/api/team/invitations", {
+        fetch(`${API_URL}/api/team/invitations`, {
           headers: { Authorization: `Bearer ${token}` },
         }),
       ]);

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { API_URL } from './config';
 
 type LoginProps = {
   onLogin: (token: string, user: any) => void;
@@ -17,7 +18,7 @@ export default function Login({ onLogin, onSwitchToRegister }: LoginProps) {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/auth/login", {
+      const res = await fetch(`${API_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),

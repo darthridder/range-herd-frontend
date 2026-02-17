@@ -8,6 +8,7 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import GeofencePanel from "./GeofencePanel";
 import AlertPanel from "./AlertPanel";
 import TeamPanel from "./TeamPanel";
+import { API_URL } from '../config';
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -175,7 +176,7 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
   const loadInitial = useCallback(async () => {
     try {
       setLoadStatus("loading");
-      const devices = (await fetch("/api/devices", {
+      const devices = (await fetch(`${API_URL}/api/devices`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then((r) => r.json())) as DeviceRow[];
 

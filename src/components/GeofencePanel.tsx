@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { API_URL } from '../config';
 
 type Geofence = {
   id: string;
@@ -31,7 +32,7 @@ export default function GeofencePanel({
 
   const loadGeofences = async () => {
     try {
-      const res = await fetch("/api/geofences", {
+      const res = await fetch(`${API_URL}/api/geofences`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (res.ok) {

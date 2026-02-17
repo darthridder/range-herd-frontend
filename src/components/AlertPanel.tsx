@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { API_URL } from '../config';
 
 type Alert = {
   id: string;
@@ -66,7 +67,7 @@ export default function AlertPanel({ token, onAlertClick }: AlertPanelProps) {
 
   const markAllAsRead = async () => {
     try {
-      const res = await fetch("/api/alerts/read-all", {
+      const res = await fetch(`${API_URL}/api/alerts/read-all`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` },
       });
