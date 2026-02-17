@@ -17,7 +17,11 @@ type GeofencePanelProps = {
   onGeofenceDeleted: () => void;
 };
 
-export default function GeofencePanel({ token, onGeofenceCreated: _onGeofenceCreated, onGeofenceDeleted }: GeofencePanelProps) {
+export default function GeofencePanel({
+  token,
+  onGeofenceCreated,
+  onGeofenceDeleted,
+}: GeofencePanelProps) {
   const [geofences, setGeofences] = useState<Geofence[]>([]);
   const [loading, setLoading] = useState(true);
 
