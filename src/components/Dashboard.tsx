@@ -8,7 +8,7 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import GeofencePanel from "./GeofencePanel";
 import AlertPanel from "./AlertPanel";
 import TeamPanel from "./TeamPanel";
-import { API_URL } from '../config';
+import { API_URL, WS_URL } from "../config";
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -109,7 +109,9 @@ function useReconnectingWebSocket(
       }
     };
 
-    ws.onerror = () => { if (isMounted.current) onStatusChange("error"); };
+    ws.onerror = () => {
+      if (isMounted.current) onStatusChange("error");
+    };
 
     ws.onclose = () => {
       if (!isMounted.current) return;
@@ -146,15 +148,24 @@ function batteryColor(pct: number | null): string {
 
 function StatusDot({ status }: { status: WsStatus }) {
   const colors: Record<WsStatus, string> = {
-    connected: "#22c55e", connecting: "#f59e0b", reconnecting: "#f59e0b",
-    closed: "#6b7280", error: "#ef4444",
+    connected: "#22c55e",
+    connecting: "#f59e0b",
+    reconnecting: "#f59e0b",
+    closed: "#6b7280",
+    error: "#ef4444",
   };
   return (
-    <span style={{
-      display: "inline-block", width: 8, height: 8, borderRadius: "50%",
-      background: colors[status], marginRight: 6,
-      boxShadow: status === "connected" ? `0 0 6px ${colors[status]}` : "none",
-    }} />
+    <span
+      style={{
+        display: "inline-block",
+        width: 8,
+        height: 8,
+        borderRadius: "50%",
+        background: colors[status],
+        marginRight: 6,
+        boxShadow: status === "connected" ? `0 0 6px ${colors[status]}` : "none",
+      }}
+    />
   );
 }
 
@@ -176,13 +187,15 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
   const loadInitial = useCallback(async () => {
     try {
       setLoadStatus("loading");
+
       const devices = (await fetch(`${API_URL}/api/devices`, {
         headers: { Authorization: `Bearer ${token}` },
       }).then((r) => r.json())) as DeviceRow[];
 
       const latestList = await Promise.allSettled(
         devices.map((d) =>
-          fetch(`/api/devices/${encodeURIComponent(d.deviceId)}/latest`, {
+          // ✅ FIX: this was the last remaining relative /api call
+          fetch(`${API_URL}/api/devices/${encodeURIComponent(d.deviceId)}/latest`, {
             headers: { Authorization: `Bearer ${token}` },
           }).then((r) => r.json())
         )
@@ -208,21 +221,25 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
     loadInitial();
   }, [loadInitial]);
 
-  const handleMessage = useCallback((msg: UplinkMessage) => {
-    if (msg.type === "uplink") {
-      const p = msg.data;
-      if (!p.deviceId) return;
-      setPointsByDevice((prev) => {
-        const existing = prev[p.deviceId] ?? [];
-        return { ...prev, [p.deviceId]: [...existing, p].slice(-100) };
-      });
-    } else if (msg.type === "alert") {
-      // Reload panels when new alert arrives
-      loadInitial();
-    }
-  }, [loadInitial]);
+  const handleMessage = useCallback(
+    (msg: UplinkMessage) => {
+      if (msg.type === "uplink") {
+        const p = msg.data;
+        if (!p.deviceId) return;
+        setPointsByDevice((prev) => {
+          const existing = prev[p.deviceId] ?? [];
+          return { ...prev, [p.deviceId]: [...existing, p].slice(-100) };
+        });
+      } else if (msg.type === "alert") {
+        loadInitial();
+      }
+    },
+    [loadInitial]
+  );
 
-  const wsUrl = `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.host}/live`;
+  // ✅ FIX: WebSocket must connect to BACKEND domain, not frontend domain
+  // Backend websocket endpoint is /live (not /api/live) based on your server.ts
+  const wsUrl = `${WS_URL}/live`;
 
   useReconnectingWebSocket(wsUrl, handleMessage, setWsStatus);
 
@@ -230,10 +247,11 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
 
   const mapCenter = useMemo<[number, number] | null>(() => {
     if (alertCenter) return alertCenter;
-    
+
     const points = selectedDevice
       ? pointsByDevice[selectedDevice] ?? []
       : Object.values(pointsByDevice).flat();
+
     const valid = points.filter((p) => p.lat != null && p.lon != null);
     const last = valid[valid.length - 1];
     return last?.lat != null && last?.lon != null ? [last.lat, last.lon] : null;
@@ -245,258 +263,169 @@ export default function Dashboard({ user, onLogout }: DashboardProps) {
   };
 
   return (
-    <div style={{
-      height: "100vh", width: "100vw",
-      display: "grid", gridTemplateColumns: "340px 1fr",
-      background: "#0f1117", color: "#e5e7eb",
-      fontFamily: "'Inter', system-ui, sans-serif", overflow: "hidden",
-    }}>
-
-      <div style={{
-        display: "flex", flexDirection: "column",
-        background: "#161b27", borderRight: "1px solid #1f2937", overflow: "hidden",
-      }}>
+    <div
+      style={{
+        height: "100vh",
+        width: "100vw",
+        display: "grid",
+        gridTemplateColumns: "340px 1fr",
+        background: "#0f1117",
+        color: "#e5e7eb",
+        fontFamily: "'Inter', system-ui, sans-serif",
+        overflow: "hidden",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          background: "#161b27",
+          borderRight: "1px solid #1f2937",
+          overflow: "hidden",
+        }}
+      >
         <div style={{ padding: "20px 16px 16px", borderBottom: "1px solid #1f2937", flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-            <span style={{ fontSize: 22 }}>🐄</span>
-            <h1 style={{ margin: 0, fontSize: 18, fontWeight: 700, letterSpacing: "-0.3px", flex: 1 }}>
-              Range Herd Tech
-            </h1>
-            <button
-              onClick={() => setShowPanel(showPanel === "alerts" ? "none" : "alerts")}
-              style={{
-                padding: "6px 12px", fontSize: 12, fontWeight: 500,
-                background: showPanel === "alerts" ? "#22c55e" : "#374151",
-                color: "#e5e7eb", border: "1px solid #4b5563",
-                borderRadius: 4, cursor: "pointer", marginRight: 4,
-              }}
-            >
-              🚨
+            <div style={{ fontSize: 18, fontWeight: 700 }}>Range Herd</div>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+              <StatusDot status={wsStatus} />
+              <span style={{ fontSize: 12, color: "#9ca3af" }}>{wsStatus}</span>
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button onClick={() => setShowPanel("alerts")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "alerts" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
+              Alerts
             </button>
-            <button
-              onClick={() => setShowPanel(showPanel === "geofences" ? "none" : "geofences")}
-              style={{
-                padding: "6px 12px", fontSize: 12, fontWeight: 500,
-                background: showPanel === "geofences" ? "#22c55e" : "#374151",
-                color: "#e5e7eb", border: "1px solid #4b5563",
-                borderRadius: 4, cursor: "pointer", marginRight: 4,
-              }}
-            >
-              🗺️
+            <button onClick={() => setShowPanel("geofences")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "geofences" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
+              Geofences
             </button>
-
-            <button
-              onClick={() => setShowPanel(showPanel === "team" ? "none" : "team")}
-              style={{
-                padding: "6px 12px", fontSize: 12, fontWeight: 500,
-                background: showPanel === "team" ? "#22c55e" : "#374151",
-                color: "#e5e7eb", border: "1px solid #4b5563",
-                borderRadius: 4, cursor: "pointer", marginRight: 4,
-     }}
-   >
-     👥
-   </button>
-            <button
-              onClick={onLogout}
-              style={{
-                padding: "6px 12px", fontSize: 12, fontWeight: 500,
-                background: "#374151", color: "#e5e7eb",
-                border: "1px solid #4b5563", borderRadius: 4,
-                cursor: "pointer", transition: "all 0.15s",
-              }}
-              
-              onMouseEnter={(e) => { e.currentTarget.style.background = "#4b5563"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "#374151"; }}
-            >
+            <button onClick={() => setShowPanel("team")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "team" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
+              Team
+            </button>
+            <button onClick={onLogout} style={{ marginLeft: "auto", padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
               Logout
             </button>
           </div>
-          <div style={{ fontSize: 12, color: "#6b7280", marginBottom: 10 }}>
-            {user.ranchName || "My Ranch"} • {user.name || user.email}
-          </div>
-          <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#9ca3af", flexWrap: "wrap" }}>
-            <span>
-              <StatusDot status={wsStatus} />
-              {wsStatus === "reconnecting" ? "Reconnecting…" : wsStatus}
-            </span>
-            <span style={{ color: loadStatus === "error" ? "#ef4444" : "#9ca3af" }}>
-              {loadStatus === "loading" && "⏳ Loading…"}
-              {loadStatus === "ready" && `✓ ${deviceIds.length} device${deviceIds.length !== 1 ? "s" : ""}`}
-              {loadStatus === "error" && "⚠ Load failed"}
-            </span>
-          </div>
         </div>
 
-        <div style={{ flex: 1, overflowY: "auto", padding: "12px 0" }}>
-          {showPanel === "team" && (
-            <TeamPanel
-            token={token!}
-            currentUserId={user.id}
-     />
-   )}
+        <div style={{ overflow: "auto", padding: 12 }}>
+          {/* Panels */}
           {showPanel === "alerts" && (
-            <AlertPanel
-              token={token!}
-              onAlertClick={handleAlertClick}
-            />
+            <AlertPanel token={token || ""} onAlertClick={handleAlertClick} />
           )}
-
           {showPanel === "geofences" && (
-            <GeofencePanel
-              token={token!}
-              onGeofenceCreated={loadInitial}
-              onGeofenceDeleted={loadInitial}
-            />
+            <GeofencePanel token={token || ""} onGeofenceCreated={loadInitial} onGeofenceDeleted={loadInitial} />
           )}
+          {showPanel === "team" && <TeamPanel token={token || ""} />}
 
-          {showPanel === "none" && (
-            <>
-              {loadStatus === "loading" && (
-                <div style={{ padding: "24px 16px", color: "#6b7280", textAlign: "center", fontSize: 13 }}>
-                  Loading devices…
-                </div>
-              )}
-              {loadStatus === "ready" && deviceIds.length === 0 && (
-                <div style={{ padding: "24px 16px", color: "#6b7280", fontSize: 13, lineHeight: 1.6 }}>
-                  <div style={{ marginBottom: 8, fontSize: 28 }}>📡</div>
-                  No devices yet. Waiting for uplinks from TTN…
-                </div>
-              )}
-              {loadStatus === "error" && (
-                <div style={{ padding: "16px", color: "#ef4444", fontSize: 13 }}>
-                  ⚠ Failed to load devices. Check backend.
-                </div>
-              )}
-
-              {deviceIds.map((id) => {
-                const arr = pointsByDevice[id];
-                const last = arr[arr.length - 1];
-                const color = getDeviceColor(id, deviceIds);
-                const isSelected = selectedDevice === id;
-                const bPct = last?.batteryPct ?? null;
-
-                return (
-                  <div key={id} onClick={() => setSelectedDevice(isSelected ? null : id)}
-                    style={{
-                      margin: "4px 8px", padding: "12px", borderRadius: 8, cursor: "pointer",
-                      background: isSelected ? "#1e2a3a" : "transparent",
-                      border: `1px solid ${isSelected ? color + "60" : "transparent"}`,
-                      transition: "all 0.15s ease",
-                    }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                      <span style={{
-                        width: 10, height: 10, borderRadius: "50%", background: color,
-                        flexShrink: 0, boxShadow: `0 0 6px ${color}`,
-                      }} />
-                      <strong style={{ fontSize: 13, flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {id}
-                      </strong>
-                    </div>
-
-                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "4px 8px", fontSize: 12, color: "#9ca3af" }}>
-                      <div>
-                        <div style={{ color: "#6b7280", fontSize: 11 }}>Last seen</div>
-                        <div style={{ color: "#e5e7eb" }}>
-                          {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : "—"}
+          {/* Device list */}
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 13, color: "#9ca3af", marginBottom: 8 }}>Devices</div>
+            {deviceIds.length === 0 ? (
+              <div style={{ fontSize: 13, color: "#9ca3af" }}>
+                {loadStatus === "loading" ? "Loading..." : "No devices yet."}
+              </div>
+            ) : (
+              <div style={{ display: "grid", gap: 10 }}>
+                {deviceIds.map((id) => {
+                  const pts = pointsByDevice[id] ?? [];
+                  const last = pts[pts.length - 1];
+                  const pct = last?.batteryPct ?? null;
+                  const color = getDeviceColor(id, deviceIds);
+                  return (
+                    <button
+                      key={id}
+                      onClick={() => setSelectedDevice(id)}
+                      style={{
+                        width: "100%",
+                        textAlign: "left",
+                        padding: "10px 12px",
+                        borderRadius: 12,
+                        border: selectedDevice === id ? `1px solid ${color}` : "1px solid #273244",
+                        background: selectedDevice === id ? "#0b1220" : "#0a0f1a",
+                        color: "#e5e7eb",
+                        cursor: "pointer",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        <span
+                          style={{
+                            display: "inline-block",
+                            width: 10,
+                            height: 10,
+                            borderRadius: "50%",
+                            background: color,
+                          }}
+                        />
+                        <div style={{ fontWeight: 700, fontSize: 13 }}>{id}</div>
+                        <div style={{ marginLeft: "auto", fontSize: 12, color: batteryColor(pct) }}>
+                          {pct == null ? "—" : `${Math.round(pct)}%`}
                         </div>
                       </div>
-                      <div>
-                        <div style={{ color: "#6b7280", fontSize: 11 }}>Battery</div>
-                        <div style={{ color: batteryColor(bPct), fontWeight: 600 }}>
-                          {bPct != null ? `${bPct.toFixed(0)}%` : "—"}
-                          {last?.batteryV != null ? ` (${last.batteryV.toFixed(2)}V)` : ""}
-                        </div>
+                      <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 6 }}>
+                        {last?.lat != null && last?.lon != null
+                          ? `Last GPS: ${last.lat.toFixed(5)}, ${last.lon.toFixed(5)}`
+                          : "No GPS yet"}
                       </div>
-                      <div>
-                        <div style={{ color: "#6b7280", fontSize: 11 }}>RSSI / SNR</div>
-                        <div style={{ color: "#e5e7eb" }}>{last?.rssi ?? "—"} / {last?.snr ?? "—"}</div>
-                      </div>
-                      <div>
-                        <div style={{ color: "#6b7280", fontSize: 11 }}>GPS</div>
-                        <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                          {last?.lat != null && last?.lon != null
-                            ? `${last.lat.toFixed(4)}, ${last.lon.toFixed(4)}`
-                            : "—"}
-                        </div>
-                      </div>
-                      {last?.tempC != null && (
-                        <div>
-                          <div style={{ color: "#6b7280", fontSize: 11 }}>Temp</div>
-                          <div style={{ color: "#e5e7eb" }}>{last.tempC.toFixed(1)}°C</div>
-                        </div>
-                      )}
-                      {last?.altM != null && (
-                        <div>
-                          <div style={{ color: "#6b7280", fontSize: 11 }}>Altitude</div>
-                          <div style={{ color: "#e5e7eb" }}>{last.altM.toFixed(0)}m</div>
-                        </div>
-                      )}
-                    </div>
-
-                    <div style={{ marginTop: 8, fontSize: 11, color: "#4b5563" }}>
-                      {arr.length} point{arr.length !== 1 ? "s" : ""} in trail
-                      {isSelected && <span style={{ color, marginLeft: 6 }}>● focused</span>}
-                    </div>
-                  </div>
-                );
-              })}
-            </>
-          )}
-        </div>
-
-        <div style={{
-          padding: "10px 16px", borderTop: "1px solid #1f2937",
-          fontSize: 11, color: "#374151", flexShrink: 0,
-        }}>
-          Range Herd Tech · LoRa Cattle Tracking
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
-      <MapContainer
-        center={mapCenter ?? [32.9563, -96.3894]}
-        zoom={15}
-        style={{ height: "100%", width: "100%" }}
-      >
-        <TileLayer
-          attribution="&copy; OpenStreetMap contributors"
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        />
-        {mapCenter && <MapRecenter center={mapCenter} />}
+      <div style={{ position: "relative" }}>
+        <MapContainer
+          center={mapCenter ?? [32.9565, -96.3893]}
+          zoom={13}
+          style={{ height: "100%", width: "100%" }}
+        >
+          <TileLayer
+            attribution='&copy; OpenStreetMap contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
 
-        {deviceIds.map((id) => {
-          if (selectedDevice && selectedDevice !== id) return null;
-          const arr = pointsByDevice[id];
-          const last = arr[arr.length - 1];
-          const color = getDeviceColor(id, deviceIds);
-          const trail: [number, number][] = arr
-            .filter((p) => p.lat != null && p.lon != null)
-            .map((p) => [p.lat as number, p.lon as number]);
+          <MapRecenter center={mapCenter} />
 
-          if (!last || last.lat == null || last.lon == null) return null;
+          {deviceIds.map((id) => {
+            const pts = pointsByDevice[id] ?? [];
+            const valid = pts.filter((p) => p.lat != null && p.lon != null) as Array<
+              LivePoint & { lat: number; lon: number }
+            >;
+            if (valid.length === 0) return null;
 
-          return (
-            <div key={id}>
-              {trail.length > 1 && (
-                <Polyline positions={trail} pathOptions={{ color, weight: 2, opacity: 0.7 }} />
-              )}
-              <Marker position={[last.lat, last.lon]} icon={createColoredIcon(color)}>
-                <Popup>
-                  <div style={{ minWidth: 160 }}>
-                    <strong style={{ display: "block", marginBottom: 6 }}>{id}</strong>
-                    <div style={{ fontSize: 12, lineHeight: 1.8, color: "#374151" }}>
-                      <div>🕐 {new Date(last.receivedAt).toLocaleString()}</div>
-                      <div>🔋 {last.batteryPct != null ? `${last.batteryPct.toFixed(0)}%` : "—"} ({last.batteryV ?? "—"}V)</div>
-                      <div>📡 RSSI: {last.rssi ?? "—"} / SNR: {last.snr ?? "—"}</div>
-                      {last.tempC != null && <div>🌡 {last.tempC.toFixed(1)}°C</div>}
-                      {last.altM != null && <div>⛰ {last.altM.toFixed(0)}m alt</div>}
+            const color = getDeviceColor(id, deviceIds);
+            const last = valid[valid.length - 1];
+
+            return (
+              <div key={id as any}>
+                <Polyline
+                  positions={valid.map((p) => [p.lat, p.lon] as [number, number])}
+                  pathOptions={{ color, weight: 3 }}
+                />
+                <Marker position={[last.lat, last.lon]} icon={createColoredIcon(color)}>
+                  <Popup>
+                    <div style={{ minWidth: 200 }}>
+                      <div style={{ fontWeight: 700, marginBottom: 8 }}>{id}</div>
+                      <div style={{ fontSize: 12, color: "#111827" }}>
+                        Battery: {last.batteryPct == null ? "—" : `${Math.round(last.batteryPct)}%`}
+                      </div>
+                      <div style={{ fontSize: 12, color: "#111827" }}>
+                        RSSI: {last.rssi ?? "—"} | SNR: {last.snr ?? "—"}
+                      </div>
+                      <div style={{ fontSize: 12, color: "#111827" }}>
+                        Time: {new Date(last.receivedAt).toLocaleString()}
+                      </div>
                     </div>
-                  </div>
-                </Popup>
-              </Marker>
-            </div>
-          );
-        })}
-      </MapContainer>
+                  </Popup>
+                </Marker>
+              </div>
+            );
+          })}
+        </MapContainer>
+      </div>
     </div>
   );
 }

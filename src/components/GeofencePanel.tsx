@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { API_URL } from '../config';
+import { API_URL } from "../config";
 
 type Geofence = {
   id: string;
@@ -28,6 +28,7 @@ export default function GeofencePanel({
 
   useEffect(() => {
     loadGeofences();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   const loadGeofences = async () => {
@@ -38,7 +39,7 @@ export default function GeofencePanel({
       if (res.ok) {
         const data = await res.json();
         setGeofences(data);
-        onGeofenceCreated(); // notify parent that geofences are up-to-date
+        onGeofenceCreated();
       }
     } catch (err) {
       console.error("Failed to load geofences:", err);
@@ -51,7 +52,7 @@ export default function GeofencePanel({
     if (!confirm("Delete this geofence? This will also delete associated alerts.")) return;
 
     try {
-      const res = await fetch(`/api/geofences/${id}`, {
+      const res = await fetch(`${API_URL}/api/geofences/${id}`, {
         method: "DELETE",
         headers: { Authorization: `Bearer ${token}` },
       });
@@ -66,11 +67,7 @@ export default function GeofencePanel({
   };
 
   if (loading) {
-    return (
-      <div style={{ padding: 16, color: "#9ca3af", fontSize: 13 }}>
-        Loading geofences...
-      </div>
-    );
+    return <div style={{ padding: 16, color: "#9ca3af", fontSize: 13 }}>Loading geofences...</div>;
   }
 
   return (

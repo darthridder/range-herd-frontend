@@ -3,6 +3,9 @@ import Login from "./components/Login";
 import Register from "./components/Register";
 import Dashboard from "./components/Dashboard";
 
+console.log("VITE_API_URL from Vite =", import.meta.env.VITE_API_URL);
+
+
 type AuthView = "login" | "register" | "dashboard";
 
 export default function App() {
