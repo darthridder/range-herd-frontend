@@ -1,14 +1,45 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
-import "leaflet/dist/leaflet.css";
 import L from "leaflet";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerIcon from "leaflet/dist/images/marker-icon.png";
 import markerShadow from "leaflet/dist/images/marker-shadow.png";
-import GeofencePanel from "./GeofencePanel";
-import AlertPanel from "./AlertPanel";
-import TeamPanel from "./TeamPanel";
-import { API_URL, WS_URL } from "../config";
+
+import { MapContainer, TileLayer, Marker, Polyline, Popup } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+
+type LivePoint = {
+  id?: string;
+  deviceId: string;
+
+  lat: number;
+  lon: number;
+
+  receivedAt?: string;
+  ts?: string;
+
+  batteryPct?: number | null;
+  batteryV?: number | null;
+  rssi?: number | null;
+  snr?: number | null;
+
+  temperatureC?: number | null;
+};
+
+type DeviceRow = {
+  id: string;
+  name: string;
+  batteryPct: number | null;
+  lastLat: number | null;
+  lastLon: number | null;
+  lastSeenAt: string | null;
+};
+
+type WsStatus = "connecting" | "connected" | "reconnecting" | "error";
+type LoadStatus = "loading" | "ready" | "error";
+
+type DashboardProps = {
+  token: string;
+};
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -17,413 +48,398 @@ L.Icon.Default.mergeOptions({
   shadowUrl: markerShadow,
 });
 
-const DEVICE_COLORS = [
-  "#22c55e", "#3b82f6", "#f59e0b", "#ef4444",
-  "#a855f7", "#06b6d4", "#f97316", "#ec4899",
-];
-
-function getDeviceColor(deviceId: string, deviceIds: string[]): string {
-  const index = deviceIds.indexOf(deviceId);
-  return DEVICE_COLORS[index % DEVICE_COLORS.length];
-}
-
 function createColoredIcon(color: string) {
-  return L.divIcon({
+  return new L.DivIcon({
     className: "",
-    html: `<div style="width:14px;height:14px;border-radius:50%;background:${color};border:2px solid white;box-shadow:0 0 6px rgba(0,0,0,0.5);"></div>`,
+    html: `
+      <div style="
+        width: 14px; height: 14px;
+        background: ${color};
+        border: 2px solid white;
+        border-radius: 50%;
+        box-shadow: 0 1px 6px rgba(0,0,0,0.35);
+      "></div>
+    `,
     iconSize: [14, 14],
     iconAnchor: [7, 7],
   });
 }
 
-type LivePoint = {
-  deviceId: string;
-  receivedAt: string;
-  lat: number | null;
-  lon: number | null;
-  altM?: number | null;
-  batteryV: number | null;
-  batteryPct: number | null;
-  tempC?: number | null;
-  rssi: number | null;
-  snr: number | null;
-};
+// ===============================
+// Movement filtering (GPS drift)
+// Mark as MOVING only if last TWO consecutive moves exceed threshold.
+// ===============================
+const MOVEMENT_THRESHOLD_M = 10;
 
-type UplinkMessage =
-  | { type: "uplink"; data: LivePoint }
-  | { type: "alert"; data: any }
-  | { type: "connected" }
-  | { type: "hello"; ts: string };
+function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
+  const R = 6371000;
+  const toRad = (v: number) => (v * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
 
-type DeviceRow = { deviceId: string; devEui: string | null; lastSeen: string };
-type WsStatus = "connecting" | "connected" | "reconnecting" | "closed" | "error";
-type LoadStatus = "loading" | "ready" | "error";
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLon = Math.sin(dLon / 2);
 
-function MapRecenter({ center }: { center: [number, number] | null }) {
-  const map = useMap();
-  const lastCenter = useRef<[number, number] | null>(null);
-  useEffect(() => {
-    if (!center) return;
-    if (
-      !lastCenter.current ||
-      Math.abs(lastCenter.current[0] - center[0]) > 0.0001 ||
-      Math.abs(lastCenter.current[1] - center[1]) > 0.0001
-    ) {
-      map.panTo(center, { animate: true });
-      lastCenter.current = center;
-    }
-  }, [center, map]);
-  return null;
+  const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon * sinDLon;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-const WS_MAX_RETRIES = 10;
-const WS_BASE_DELAY_MS = 1000;
-
-function useReconnectingWebSocket(
-  url: string,
-  onMessage: (msg: UplinkMessage) => void,
-  onStatusChange: (status: WsStatus) => void
-) {
-  const retryCount = useRef(0);
-  const retryTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isMounted = useRef(true);
-
-  const connect = useCallback(() => {
-    if (!isMounted.current) return;
-    onStatusChange(retryCount.current === 0 ? "connecting" : "reconnecting");
-
-    const ws = new WebSocket(url);
-
-    ws.onopen = () => {
-      if (!isMounted.current) return;
-      retryCount.current = 0;
-      onStatusChange("connected");
-    };
-
-    ws.onmessage = (event) => {
-      if (!isMounted.current) return;
-      try {
-        onMessage(JSON.parse(event.data) as UplinkMessage);
-      } catch {
-        console.warn("Failed to parse WS message:", event.data);
-      }
-    };
-
-    ws.onerror = () => {
-      if (isMounted.current) onStatusChange("error");
-    };
-
-    ws.onclose = () => {
-      if (!isMounted.current) return;
-      if (retryCount.current < WS_MAX_RETRIES) {
-        const delay = Math.min(WS_BASE_DELAY_MS * 2 ** retryCount.current, 30000);
-        retryCount.current++;
-        onStatusChange("reconnecting");
-        retryTimeout.current = setTimeout(connect, delay);
-      } else {
-        onStatusChange("closed");
-      }
-    };
-
-    return ws;
-  }, [url, onMessage, onStatusChange]);
-
-  useEffect(() => {
-    isMounted.current = true;
-    const ws = connect();
-    return () => {
-      isMounted.current = false;
-      if (retryTimeout.current) clearTimeout(retryTimeout.current);
-      ws?.close();
-    };
-  }, [connect]);
-}
-
-function batteryColor(pct: number | null): string {
-  if (pct == null) return "#9ca3af";
-  if (pct > 50) return "#22c55e";
-  if (pct > 20) return "#f59e0b";
-  return "#ef4444";
-}
-
-function StatusDot({ status }: { status: WsStatus }) {
-  const colors: Record<WsStatus, string> = {
-    connected: "#22c55e",
-    connecting: "#f59e0b",
-    reconnecting: "#f59e0b",
-    closed: "#6b7280",
-    error: "#ef4444",
-  };
-  return (
-    <span
-      style={{
-        display: "inline-block",
-        width: 8,
-        height: 8,
-        borderRadius: "50%",
-        background: colors[status],
-        marginRight: 6,
-        boxShadow: status === "connected" ? `0 0 6px ${colors[status]}` : "none",
-      }}
-    />
-  );
-}
-
-type DashboardProps = {
-  user: any;
-  onLogout: () => void;
-};
-
-export default function Dashboard({ user, onLogout }: DashboardProps) {
-  const [pointsByDevice, setPointsByDevice] = useState<Record<string, LivePoint[]>>({});
+export default function Dashboard({ token }: DashboardProps) {
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("loading");
+
+  const [devices, setDevices] = useState<DeviceRow[]>([]);
+  const [pointsByDevice, setPointsByDevice] = useState<Record<string, LivePoint[]>>({});
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
-  const [showPanel, setShowPanel] = useState<"none" | "alerts" | "geofences" | "team">("none");
+
   const [alertCenter, setAlertCenter] = useState<[number, number] | null>(null);
 
-  const token = localStorage.getItem("token");
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
 
-  const loadInitial = useCallback(async () => {
-    try {
-      setLoadStatus("loading");
+  const apiUrl = (import.meta as any).env?.VITE_API_URL || "";
 
-      const devices = (await fetch(`${API_URL}/api/devices`, {
+  const fetchJson = useCallback(
+    async (path: string) => {
+      const url = apiUrl ? `${apiUrl}${path}` : path;
+      const res = await fetch(url, {
         headers: { Authorization: `Bearer ${token}` },
-      }).then((r) => r.json())) as DeviceRow[];
-
-      const latestList = await Promise.allSettled(
-        devices.map((d) =>
-          // ✅ FIX: this was the last remaining relative /api call
-          fetch(`${API_URL}/api/devices/${encodeURIComponent(d.deviceId)}/latest`, {
-            headers: { Authorization: `Bearer ${token}` },
-          }).then((r) => r.json())
-        )
-      );
-
-      const seeded: Record<string, LivePoint[]> = {};
-      for (const result of latestList) {
-        if (result.status === "fulfilled") {
-          const item = result.value as LivePoint | null;
-          if (item?.deviceId) seeded[item.deviceId] = [item];
-        }
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        throw new Error(`${res.status} ${res.statusText} ${text}`);
       }
-
-      setPointsByDevice(seeded);
-      setLoadStatus("ready");
-    } catch (e) {
-      console.error("Initial load failed:", e);
-      setLoadStatus("error");
-    }
-  }, [token]);
-
-  useEffect(() => {
-    loadInitial();
-  }, [loadInitial]);
-
-  const handleMessage = useCallback(
-    (msg: UplinkMessage) => {
-      if (msg.type === "uplink") {
-        const p = msg.data;
-        if (!p.deviceId) return;
-        setPointsByDevice((prev) => {
-          const existing = prev[p.deviceId] ?? [];
-          return { ...prev, [p.deviceId]: [...existing, p].slice(-100) };
-        });
-      } else if (msg.type === "alert") {
-        loadInitial();
-      }
+      return res.json();
     },
-    [loadInitial]
+    [apiUrl, token]
   );
 
-  // ✅ FIX: WebSocket must connect to BACKEND domain, not frontend domain
-  // Backend websocket endpoint is /live (not /api/live) based on your server.ts
-  const wsUrl = `${WS_URL}/live`;
+  const loadDevices = useCallback(async () => {
+    const data = await fetchJson("/api/devices");
+    setDevices(data);
+  }, [fetchJson]);
 
-  useReconnectingWebSocket(wsUrl, handleMessage, setWsStatus);
+  const loadLatestPoints = useCallback(async () => {
+    const data = await fetchJson("/api/live/latest");
+    // expected: array of latest points
+    const by: Record<string, LivePoint[]> = {};
+    for (const p of data as LivePoint[]) {
+      if (!by[p.deviceId]) by[p.deviceId] = [];
+      by[p.deviceId].push(p);
+    }
+    setPointsByDevice((prev) => {
+      // merge with previous history (keep last N per device)
+      const merged: Record<string, LivePoint[]> = { ...prev };
+      for (const [id, pts] of Object.entries(by)) {
+        const existing = merged[id] || [];
+        const next = [...existing, ...pts];
+
+        // de-dup by timestamp+coords if repeated
+        const seen = new Set<string>();
+        const deduped: LivePoint[] = [];
+        for (const x of next) {
+          const key = `${x.ts || x.receivedAt || ""}-${x.lat}-${x.lon}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          deduped.push(x);
+        }
+
+        // sort and keep last 60 points (adjust if you want)
+        deduped.sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime());
+        merged[id] = deduped.slice(-60);
+      }
+      return merged;
+    });
+  }, [fetchJson]);
+
+  // Initial load + polling (your UI updating every ~30s comes from this)
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      try {
+        setLoadStatus("loading");
+        await loadDevices();
+        await loadLatestPoints();
+        if (!mounted) return;
+        setLoadStatus("ready");
+      } catch (e) {
+        console.error(e);
+        if (!mounted) return;
+        setLoadStatus("error");
+      }
+    })();
+
+    // poll latest every 60s (adjust to 5s / 10s if you want more “live”)
+    pollTimerRef.current = window.setInterval(async () => {
+      try {
+        await loadDevices();
+        await loadLatestPoints();
+      } catch (e) {
+        console.error("poll error", e);
+      }
+    }, 60000);
+
+    return () => {
+      mounted = false;
+      if (pollTimerRef.current) window.clearInterval(pollTimerRef.current);
+    };
+  }, [loadDevices, loadLatestPoints]);
+
+  // WebSocket (optional) – keeps the “connected” indicator and lets server nudge updates
+  const connectWs = useCallback(() => {
+    try {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+
+      setWsStatus("connecting");
+
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${protocol}://${window.location.host}/live`;
+
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setWsStatus("connected");
+      };
+
+      ws.onmessage = async (evt) => {
+        try {
+          const msg = JSON.parse(evt.data || "{}");
+          // If backend broadcasts “live_point” or “tick”, refresh latest immediately
+          if (msg?.type === "live_point" || msg?.type === "tick" || msg?.type === "ttn_uplink") {
+            await loadLatestPoints();
+            await loadDevices();
+          }
+        } catch (e) {
+          // ignore
+        }
+      };
+
+      ws.onerror = () => {
+        setWsStatus("error");
+      };
+
+      ws.onclose = () => {
+        setWsStatus("reconnecting");
+        if (reconnectTimerRef.current) window.clearInterval(reconnectTimerRef.current);
+        reconnectTimerRef.current = window.setTimeout(() => connectWs(), 1500) as any;
+      };
+    } catch (e) {
+      console.error("WS connect failed", e);
+      setWsStatus("error");
+    }
+  }, [loadLatestPoints, loadDevices]);
+
+  useEffect(() => {
+    connectWs();
+    return () => {
+      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [connectWs]);
+
+  const allPoints = useMemo(() => Object.values(pointsByDevice).flat(), [pointsByDevice]);
+
+  const mapCenter = useMemo<[number, number]>(() => {
+    if (alertCenter) return alertCenter;
+    const latest = allPoints
+      .slice()
+      .sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime())
+      .at(-1);
+
+    if (latest) return [latest.lat, latest.lon];
+    return [32.9565, -96.3893]; // default
+  }, [alertCenter, allPoints]);
 
   const deviceIds = Object.keys(pointsByDevice);
 
-  const mapCenter = useMemo<[number, number] | null>(() => {
-    if (alertCenter) return alertCenter;
+  type MotionState = "moving" | "stationary" | "unknown";
+  const motionByDevice = useMemo(() => {
+    const out: Record<string, MotionState> = {};
 
-    const points = selectedDevice
-      ? pointsByDevice[selectedDevice] ?? []
-      : Object.values(pointsByDevice).flat();
+    for (const [deviceId, pts] of Object.entries(pointsByDevice)) {
+      // Need 3 points to evaluate TWO consecutive moves (p1->p2 and p2->p3)
+      if (!pts || pts.length < 3) {
+        out[deviceId] = "unknown";
+        continue;
+      }
 
-    const valid = points.filter((p) => p.lat != null && p.lon != null);
-    const last = valid[valid.length - 1];
-    return last?.lat != null && last?.lon != null ? [last.lat, last.lon] : null;
-  }, [pointsByDevice, selectedDevice, alertCenter]);
+      const sorted = [...pts].sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime());
+      const p1 = sorted[sorted.length - 3];
+      const p2 = sorted[sorted.length - 2];
+      const p3 = sorted[sorted.length - 1];
 
-  const handleAlertClick = (lat: number, lon: number) => {
-    setAlertCenter([lat, lon]);
-    setTimeout(() => setAlertCenter(null), 100);
-  };
+      const d1 = haversineMeters({ lat: p1.lat, lon: p1.lon }, { lat: p2.lat, lon: p2.lon });
+      const d2 = haversineMeters({ lat: p2.lat, lon: p2.lon }, { lat: p3.lat, lon: p3.lon });
+
+      out[deviceId] = d1 > MOVEMENT_THRESHOLD_M && d2 > MOVEMENT_THRESHOLD_M ? "moving" : "stationary";
+    }
+
+    return out;
+  }, [pointsByDevice]);
+
+  const selectedPoints = useMemo(() => {
+    if (!selectedDevice) return [];
+    return pointsByDevice[selectedDevice] || [];
+  }, [selectedDevice, pointsByDevice]);
+
+  const routePolyline = useMemo(() => {
+    if (!selectedDevice) return null;
+    const pts = selectedPoints;
+    if (pts.length < 2) return null;
+    return pts.map((p) => [p.lat, p.lon]) as [number, number][];
+  }, [selectedDevice, selectedPoints]);
+
+  const wsDotColor = wsStatus === "connected" ? "#22c55e" : wsStatus === "reconnecting" ? "#f59e0b" : wsStatus === "error" ? "#ef4444" : "#9ca3af";
 
   return (
-    <div
-      style={{
-        height: "100vh",
-        width: "100vw",
-        display: "grid",
-        gridTemplateColumns: "340px 1fr",
-        background: "#0f1117",
-        color: "#e5e7eb",
-        fontFamily: "'Inter', system-ui, sans-serif",
-        overflow: "hidden",
-      }}
-    >
+    <div style={{ display: "flex", height: "100vh", width: "100vw", background: "#0b1020" }}>
+      {/* Left sidebar */}
       <div
         style={{
-          display: "flex",
-          flexDirection: "column",
-          background: "#161b27",
-          borderRight: "1px solid #1f2937",
-          overflow: "hidden",
+          width: 320,
+          borderRight: "1px solid rgba(255,255,255,0.08)",
+          padding: 14,
+          color: "white",
         }}
       >
-        <div style={{ padding: "20px 16px 16px", borderBottom: "1px solid #1f2937", flexShrink: 0 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
-            <div style={{ fontSize: 18, fontWeight: 700 }}>Range Herd</div>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-              <StatusDot status={wsStatus} />
-              <span style={{ fontSize: 12, color: "#9ca3af" }}>{wsStatus}</span>
-            </div>
-          </div>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button onClick={() => setShowPanel("alerts")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "alerts" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
-              Alerts
-            </button>
-            <button onClick={() => setShowPanel("geofences")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "geofences" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
-              Geofences
-            </button>
-            <button onClick={() => setShowPanel("team")} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: showPanel === "team" ? "#1f2937" : "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
-              Team
-            </button>
-            <button onClick={onLogout} style={{ marginLeft: "auto", padding: "8px 10px", borderRadius: 10, border: "1px solid #273244", background: "#0b1220", color: "#e5e7eb", cursor: "pointer" }}>
-              Logout
-            </button>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <div style={{ fontSize: 18, fontWeight: 800 }}>Range Herd</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 50, background: wsDotColor }} />
+            <div style={{ fontSize: 12, color: "#cbd5e1" }}>{wsStatus}</div>
           </div>
         </div>
 
-        <div style={{ overflow: "auto", padding: 12 }}>
-          {/* Panels */}
-          {showPanel === "alerts" && (
-            <AlertPanel token={token || ""} onAlertClick={handleAlertClick} />
-          )}
-          {showPanel === "geofences" && (
-            <GeofencePanel token={token || ""} onGeofenceCreated={loadInitial} onGeofenceDeleted={loadInitial} />
-          )}
-          {showPanel === "team" && <TeamPanel token={token || ""} />}
+        <div style={{ height: 12 }} />
 
-          {/* Device list */}
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 13, color: "#9ca3af", marginBottom: 8 }}>Devices</div>
-            {deviceIds.length === 0 ? (
-              <div style={{ fontSize: 13, color: "#9ca3af" }}>
-                {loadStatus === "loading" ? "Loading..." : "No devices yet."}
-              </div>
-            ) : (
-              <div style={{ display: "grid", gap: 10 }}>
-                {deviceIds.map((id) => {
-                  const pts = pointsByDevice[id] ?? [];
-                  const last = pts[pts.length - 1];
-                  const pct = last?.batteryPct ?? null;
-                  const color = getDeviceColor(id, deviceIds);
-                  return (
-                    <button
-                      key={id}
-                      onClick={() => setSelectedDevice(id)}
-                      style={{
-                        width: "100%",
-                        textAlign: "left",
-                        padding: "10px 12px",
-                        borderRadius: 12,
-                        border: selectedDevice === id ? `1px solid ${color}` : "1px solid #273244",
-                        background: selectedDevice === id ? "#0b1220" : "#0a0f1a",
-                        color: "#e5e7eb",
-                        cursor: "pointer",
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                        <span
-                          style={{
-                            display: "inline-block",
-                            width: 10,
-                            height: 10,
-                            borderRadius: "50%",
-                            background: color,
-                          }}
-                        />
-                        <div style={{ fontWeight: 700, fontSize: 13 }}>{id}</div>
-                        <div style={{ marginLeft: "auto", fontSize: 12, color: batteryColor(pct) }}>
-                          {pct == null ? "—" : `${Math.round(pct)}%`}
-                        </div>
+        <div style={{ fontSize: 12, color: "#cbd5e1", opacity: 0.9, marginBottom: 10 }}>
+          {loadStatus === "loading" ? "Loading…" : loadStatus === "error" ? "Error loading data" : "Live map"}
+        </div>
+
+        <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Devices</div>
+
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {deviceIds.length === 0 ? (
+            <div style={{ color: "#94a3b8", fontSize: 12 }}>No devices yet.</div>
+          ) : (
+            deviceIds.map((id) => {
+              const pts = pointsByDevice[id] || [];
+              const last = pts[pts.length - 1];
+              const bPct = last?.batteryPct ?? null;
+
+              const motion = motionByDevice[id] ?? "unknown";
+              const motionLabel = motion === "moving" ? "Moving" : motion === "stationary" ? "Stationary" : "—";
+              const motionColor = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#6b7280";
+
+              const isSelected = selectedDevice === id;
+              return (
+                <button
+                  key={id}
+                  onClick={() => setSelectedDevice((cur) => (cur === id ? null : id))}
+                  style={{
+                    width: "100%",
+                    textAlign: "left",
+                    borderRadius: 12,
+                    border: isSelected ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
+                    background: "rgba(255,255,255,0.03)",
+                    padding: 10,
+                    cursor: "pointer",
+                    color: "white",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div style={{ fontWeight: 800, fontSize: 13 }}>{id}</div>
+                    <div style={{ fontSize: 12, color: "#cbd5e1" }}>{bPct != null ? `${bPct.toFixed(0)}%` : "—"}</div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 8 }}>
+                    <div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
+                      <div style={{ color: "#e5e7eb", fontSize: 11 }}>
+                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : last?.ts ? new Date(last.ts).toLocaleTimeString() : "—"}
                       </div>
-                      <div style={{ fontSize: 12, color: "#9ca3af", marginTop: 6 }}>
-                        {last?.lat != null && last?.lon != null
-                          ? `Last GPS: ${last.lat.toFixed(5)}, ${last.lon.toFixed(5)}`
-                          : "No GPS yet"}
+                    </div>
+
+                    <div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>Battery</div>
+                      <div style={{ color: "#e5e7eb", fontSize: 11 }}>
+                        {last?.batteryPct != null ? `${last.batteryPct.toFixed(0)}%` : "—"}{" "}
+                        {last?.batteryV != null ? `(${last.batteryV.toFixed(2)}V)` : ""}
                       </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+                    </div>
+
+                    <div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>GPS</div>
+                      <div style={{ color: "#e5e7eb", fontSize: 11 }}>
+                        {last?.lat != null && last?.lon != null ? `${last.lat.toFixed(4)}, ${last.lon.toFixed(4)}` : "—"}
+                      </div>
+                    </div>
+
+                    <div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>Status</div>
+                      <div style={{ color: motionColor, fontWeight: 700 }}>{motionLabel}</div>
+                    </div>
+
+                    {last?.temperatureC != null ? (
+                      <div>
+                        <div style={{ color: "#6b7280", fontSize: 11 }}>Temp</div>
+                        <div style={{ color: "#e5e7eb", fontSize: 11 }}>{last.temperatureC.toFixed(1)}°C</div>
+                      </div>
+                    ) : null}
+                  </div>
+                </button>
+              );
+            })
+          )}
         </div>
       </div>
 
-      <div style={{ position: "relative" }}>
-        <MapContainer
-          center={mapCenter ?? [32.9565, -96.3893]}
-          zoom={13}
-          style={{ height: "100%", width: "100%" }}
-        >
+      {/* Map */}
+      <div style={{ flex: 1 }}>
+        <MapContainer center={mapCenter} zoom={13} style={{ height: "100%", width: "100%" }}>
           <TileLayer
-            attribution='&copy; OpenStreetMap contributors'
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          <MapRecenter center={mapCenter} />
-
+          {/* Device markers */}
           {deviceIds.map((id) => {
-            const pts = pointsByDevice[id] ?? [];
-            const valid = pts.filter((p) => p.lat != null && p.lon != null) as Array<
-              LivePoint & { lat: number; lon: number }
-            >;
-            if (valid.length === 0) return null;
+            const pts = pointsByDevice[id] || [];
+            const p = pts[pts.length - 1];
+            if (!p) return null;
 
-            const color = getDeviceColor(id, deviceIds);
-            const last = valid[valid.length - 1];
+            const motion = motionByDevice[id] ?? "unknown";
+            const color = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
+            const icon = createColoredIcon(color);
 
             return (
-              <div key={id as any}>
-                <Polyline
-                  positions={valid.map((p) => [p.lat, p.lon] as [number, number])}
-                  pathOptions={{ color, weight: 3 }}
-                />
-                <Marker position={[last.lat, last.lon]} icon={createColoredIcon(color)}>
-                  <Popup>
-                    <div style={{ minWidth: 200 }}>
-                      <div style={{ fontWeight: 700, marginBottom: 8 }}>{id}</div>
-                      <div style={{ fontSize: 12, color: "#111827" }}>
-                        Battery: {last.batteryPct == null ? "—" : `${Math.round(last.batteryPct)}%`}
-                      </div>
-                      <div style={{ fontSize: 12, color: "#111827" }}>
-                        RSSI: {last.rssi ?? "—"} | SNR: {last.snr ?? "—"}
-                      </div>
-                      <div style={{ fontSize: 12, color: "#111827" }}>
-                        Time: {new Date(last.receivedAt).toLocaleString()}
-                      </div>
+              <Marker key={id} position={[p.lat, p.lon]} icon={icon}>
+                <Popup>
+                  <div style={{ minWidth: 220 }}>
+                    <div style={{ fontWeight: 800 }}>{id}</div>
+                    <div>🕐 {p.receivedAt ? new Date(p.receivedAt).toLocaleString() : p.ts ? new Date(p.ts).toLocaleString() : "—"}</div>
+                    <div>
+                      📍 Status: {(motionByDevice[id] ?? "unknown") === "moving" ? "Moving" : (motionByDevice[id] ?? "unknown") === "stationary" ? "Stationary" : "—"}
                     </div>
-                  </Popup>
-                </Marker>
-              </div>
+                    <div>🔋 {p.batteryPct != null ? `${p.batteryPct.toFixed(0)}%` : "—"} {p.batteryV != null ? `(${p.batteryV.toFixed(2)}V)` : ""}</div>
+                    <div>📶 RSSI/SNR: {p.rssi ?? "—"} / {p.snr ?? "—"}</div>
+                    {p.temperatureC != null ? <div>🌡️ {p.temperatureC.toFixed(1)}°C</div> : null}
+                  </div>
+                </Popup>
+              </Marker>
             );
           })}
+
+          {/* Selected route */}
+          {routePolyline ? <Polyline positions={routePolyline} /> : null}
         </MapContainer>
       </div>
     </div>
