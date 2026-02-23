@@ -91,7 +91,6 @@ function createColoredIcon(color: string) {
   });
 }
 
-// Movement filtering: moving only if last 2 consecutive moves exceed threshold
 const MOVEMENT_THRESHOLD_M = 10;
 
 function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
@@ -417,7 +416,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // WebSocket – connect to backend
+  // ✅ FIXED: no self-reference in deps
   const connectWs = useCallback(() => {
     try {
       if (wsRef.current) {
@@ -451,7 +450,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       console.error("WS connect failed", e);
       setWsStatus("error");
     }
-  }, [loadLatestPoints, loadDevices, loadUnclaimed, connectWs]);
+  }, [loadLatestPoints, loadDevices, loadUnclaimed]);
 
   useEffect(() => {
     connectWs();
@@ -459,7 +458,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) wsRef.current.close();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectWs]);
 
   type MotionState = "moving" | "stationary" | "unknown";
@@ -587,9 +585,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
             <div>
               <div style={{ fontWeight: 900, fontSize: 13 }}>Geofences</div>
-              <div style={{ fontSize: 11, color: "#94a3b8" }}>
-                Draw on the map (top-right tools). Saved to DB.
-              </div>
+              <div style={{ fontSize: 11, color: "#94a3b8" }}>Draw on the map (top-right tools). Saved to DB.</div>
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
@@ -620,7 +616,15 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                   }}
                 >
                   <div style={{ minWidth: 0 }}>
-                    <div style={{ fontWeight: 900, fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    <div
+                      style={{
+                        fontWeight: 900,
+                        fontSize: 12,
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                      }}
+                    >
                       {g.name}
                     </div>
                     <div style={{ fontSize: 11, color: "#94a3b8" }}>
@@ -650,9 +654,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                 </div>
               ))}
               {geofences.length > 10 ? (
-                <div style={{ fontSize: 11, color: "#94a3b8" }}>
-                  Showing 10 of {geofences.length}
-                </div>
+                <div style={{ fontSize: 11, color: "#94a3b8" }}>Showing 10 of {geofences.length}</div>
               ) : null}
             </div>
           ) : (
@@ -788,13 +790,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         </div>
 
         <div style={{ height: 20 }} />
-        <div style={{ fontSize: 11, color: "#6b7280" }}>
-          Logged in as: {user?.email ?? "—"}
-        </div>
+        <div style={{ fontSize: 11, color: "#6b7280" }}>Logged in as: {user?.email ?? "—"}</div>
       </div>
 
       {/* Map */}
-      <div style={{ flex: 1 }}>
+      <div style={{ flex: 1, position: "relative" }}>
         <MapContainer center={mapCenter} zoom={13} style={{ height: "100%", width: "100%" }}>
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
@@ -889,7 +889,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           {routePolyline ? <Polyline positions={routePolyline} /> : null}
         </MapContainer>
 
-        {/* Tiny “busy” hint */}
         {geofenceBusy ? (
           <div
             style={{
