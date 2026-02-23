@@ -53,7 +53,7 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
-  polygon: any; // JSON in DB
+  polygon: any;
   createdAt?: string;
 };
 
@@ -66,7 +66,7 @@ type DashboardProps = {
   onLogout?: () => void;
 };
 
-// Leaflet default marker icon fix (Vite)
+// Leaflet marker fix
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: markerIcon2x,
@@ -91,7 +91,21 @@ function createColoredIcon(color: string) {
   });
 }
 
-const MOVEMENT_THRESHOLD_M = 10;
+/**
+ * Motion detection tuning:
+ * - Increase threshold to beat GPS drift
+ * - Require recent points
+ * - Require reasonable speed (distance / time)
+ */
+const MOVEMENT_THRESHOLD_M = 25;
+const RECENT_WINDOW_MS = 5 * 60_000;
+const MAX_GAP_MS = 90_000;
+const MIN_SPEED_MPS = 0.6;
+
+function toMs(t?: string) {
+  const v = t ? new Date(t).getTime() : 0;
+  return Number.isFinite(v) ? v : 0;
+}
 
 function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
   const R = 6371000;
@@ -112,7 +126,6 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
 function coercePolygonLatLngs(polygon: any): [number, number][] | null {
   if (!polygon) return null;
 
-  // 1) [[lat, lon], ...]
   if (Array.isArray(polygon) && polygon.length > 0 && Array.isArray(polygon[0])) {
     const first = polygon[0];
     if (typeof first[0] === "number" && typeof first[1] === "number") {
@@ -120,7 +133,6 @@ function coercePolygonLatLngs(polygon: any): [number, number][] | null {
     }
   }
 
-  // 2) [{lat, lon}, ...]
   if (Array.isArray(polygon) && polygon.length > 0 && typeof polygon[0] === "object") {
     const pt = polygon[0];
     if (pt?.lat != null && pt?.lon != null) {
@@ -130,13 +142,11 @@ function coercePolygonLatLngs(polygon: any): [number, number][] | null {
     }
   }
 
-  // 3) GeoJSON-ish: { coordinates: [[[lon,lat],...]] }
   if (typeof polygon === "object" && polygon?.coordinates) {
     const ring = polygon.coordinates?.[0];
     if (Array.isArray(ring) && ring.length > 0 && Array.isArray(ring[0])) {
       const c0 = ring[0];
       if (typeof c0[0] === "number" && typeof c0[1] === "number") {
-        // GeoJSON is [lon, lat]
         return ring.map((c: any) => [Number(c[1]), Number(c[0])] as [number, number]);
       }
     }
@@ -146,7 +156,6 @@ function coercePolygonLatLngs(polygon: any): [number, number][] | null {
 }
 
 function polygonLatLngsToDb(latlngs: any): [number, number][] {
-  // Leaflet polygon can be LatLng[] (simple) or LatLng[][] (multi-ring)
   const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
   if (!Array.isArray(ring)) return [];
   return ring
@@ -165,7 +174,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   const [pointsByDevice, setPointsByDevice] = useState<Record<string, LivePoint[]>>({});
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
 
-  // Geofences
   const [geofences, setGeofences] = useState<Geofence[]>([]);
   const [showGeofences, setShowGeofences] = useState(true);
   const [geofenceBusy, setGeofenceBusy] = useState(false);
@@ -226,7 +234,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const existing = merged[id] || [];
         const next = [...existing, ...pts];
 
-        // de-dupe
         const seen = new Set<string>();
         const deduped: LivePoint[] = [];
         for (const x of next) {
@@ -236,12 +243,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           deduped.push(x);
         }
 
-        deduped.sort(
-          (a, b) =>
-            new Date(a.ts || a.receivedAt || 0).getTime() -
-            new Date(b.ts || b.receivedAt || 0).getTime()
-        );
-
+        deduped.sort((a, b) => toMs(a.ts || a.receivedAt) - toMs(b.ts || b.receivedAt));
         merged[id] = deduped.slice(-120);
       }
 
@@ -334,13 +336,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     [token, loadGeofences]
   );
 
-  // Draw handler (circle + polygon)
   const handleGeofenceCreated = useCallback(
     async (e: any) => {
       const layer = e?.layer as any;
       if (!layer) return;
 
-      // Circle
       if (layer instanceof L.Circle && !(layer instanceof (L as any).CircleMarker)) {
         const center = layer.getLatLng();
         const radius = layer.getRadius();
@@ -353,11 +353,9 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           radiusM: radius,
           polygon: null,
         });
-
         return;
       }
 
-      // Polygon (exclude rectangle)
       if (layer instanceof L.Polygon && !(layer instanceof L.Rectangle)) {
         const latlngs = layer.getLatLngs();
         const coords = polygonLatLngsToDb(latlngs);
@@ -372,14 +370,12 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             polygon: coords,
           });
         }
-
-        return;
       }
     },
     [createGeofence]
   );
 
-  // Initial load + polling
+  // initial load + polling
   useEffect(() => {
     let mounted = true;
 
@@ -416,53 +412,68 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // ✅ FIXED: no self-reference in deps
-  const connectWs = useCallback(() => {
-    try {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-
-      setWsStatus("connecting");
-
-      const ws = new WebSocket(`${WS_URL}/api/live`);
-      wsRef.current = ws;
-
-      ws.onopen = () => setWsStatus("connected");
-
-      ws.onmessage = async () => {
-        try {
-          await loadLatestPoints();
-          await loadDevices();
-          await loadUnclaimed();
-        } catch {}
-      };
-
-      ws.onerror = () => setWsStatus("error");
-
-      ws.onclose = () => {
-        setWsStatus("reconnecting");
-        if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = window.setTimeout(() => connectWs(), 1500) as any;
-      };
-    } catch (e) {
-      console.error("WS connect failed", e);
-      setWsStatus("error");
-    }
-  }, [loadLatestPoints, loadDevices, loadUnclaimed]);
-
+  // WebSocket connect (no self reference)
   useEffect(() => {
-    connectWs();
+    let stopped = false;
+
+    function connect() {
+      if (stopped) return;
+
+      try {
+        if (wsRef.current) {
+          wsRef.current.close();
+          wsRef.current = null;
+        }
+
+        setWsStatus((prev) => (prev === "connected" ? "reconnecting" : "connecting"));
+
+        const ws = new WebSocket(`${WS_URL}/api/live`);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          if (stopped) return;
+          setWsStatus("connected");
+        };
+
+        ws.onmessage = async () => {
+          try {
+            await loadLatestPoints();
+            await loadDevices();
+            await loadUnclaimed();
+          } catch {}
+        };
+
+        ws.onerror = () => {
+          if (stopped) return;
+          setWsStatus("error");
+        };
+
+        ws.onclose = () => {
+          if (stopped) return;
+          setWsStatus("reconnecting");
+          if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = window.setTimeout(() => connect(), 1500) as any;
+        };
+      } catch (e) {
+        console.error("WS connect failed", e);
+        setWsStatus("error");
+      }
+    }
+
+    connect();
+
     return () => {
+      stopped = true;
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [connectWs]);
+  }, [loadLatestPoints, loadDevices, loadUnclaimed]);
 
+  // Motion state
   type MotionState = "moving" | "stationary" | "unknown";
   const motionByDevice = useMemo(() => {
     const out: Record<string, MotionState> = {};
+    const now = Date.now();
 
     for (const [deviceId, pts] of Object.entries(pointsByDevice)) {
       if (!pts || pts.length < 3) {
@@ -470,25 +481,62 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         continue;
       }
 
-      const sorted = [...pts].sort(
-        (a, b) =>
-          new Date(a.ts || a.receivedAt || 0).getTime() -
-          new Date(b.ts || b.receivedAt || 0).getTime()
-      );
-
+      const sorted = [...pts].sort((a, b) => toMs(a.ts || a.receivedAt) - toMs(b.ts || b.receivedAt));
       const p1 = sorted[sorted.length - 3];
       const p2 = sorted[sorted.length - 2];
       const p3 = sorted[sorted.length - 1];
 
-      const d1 = haversineMeters({ lat: p1.lat, lon: p1.lon }, { lat: p2.lat, lon: p2.lon });
-      const d2 = haversineMeters({ lat: p2.lat, lon: p2.lon }, { lat: p3.lat, lon: p3.lon });
+      const t1 = toMs(p1.ts || p1.receivedAt);
+      const t2 = toMs(p2.ts || p2.receivedAt);
+      const t3 = toMs(p3.ts || p3.receivedAt);
 
-      out[deviceId] =
-        d1 > MOVEMENT_THRESHOLD_M && d2 > MOVEMENT_THRESHOLD_M ? "moving" : "stationary";
+      if (!t1 || !t2 || !t3) {
+        out[deviceId] = "unknown";
+        continue;
+      }
+
+      if (now - t3 > RECENT_WINDOW_MS) {
+        out[deviceId] = "stationary";
+        continue;
+      }
+
+      const dt12 = t2 - t1;
+      const dt23 = t3 - t2;
+
+      if (dt12 > MAX_GAP_MS || dt23 > MAX_GAP_MS || dt12 <= 0 || dt23 <= 0) {
+        out[deviceId] = "stationary";
+        continue;
+      }
+
+      const d12 = haversineMeters({ lat: p1.lat, lon: p1.lon }, { lat: p2.lat, lon: p2.lon });
+      const d23 = haversineMeters({ lat: p2.lat, lon: p2.lon }, { lat: p3.lat, lon: p3.lon });
+
+      const v12 = d12 / (dt12 / 1000);
+      const v23 = d23 / (dt23 / 1000);
+
+      const moving =
+        d12 > MOVEMENT_THRESHOLD_M &&
+        d23 > MOVEMENT_THRESHOLD_M &&
+        v12 > MIN_SPEED_MPS &&
+        v23 > MIN_SPEED_MPS;
+
+      out[deviceId] = moving ? "moving" : "stationary";
     }
 
     return out;
   }, [pointsByDevice]);
+
+  const allPoints = useMemo(() => Object.values(pointsByDevice).flat(), [pointsByDevice]);
+
+  const mapCenter = useMemo<[number, number]>(() => {
+    const latest = allPoints
+      .slice()
+      .sort((a, b) => toMs(a.ts || a.receivedAt) - toMs(b.ts || b.receivedAt))
+      .at(-1);
+
+    if (latest) return [latest.lat, latest.lon];
+    return [32.9565, -96.3893];
+  }, [allPoints]);
 
   const selectedPoints = useMemo(() => {
     if (!selectedDevice) return [];
@@ -501,22 +549,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     return selectedPoints.map((p) => [p.lat, p.lon]) as [number, number][];
   }, [selectedDevice, selectedPoints]);
 
-  const allPoints = useMemo(() => Object.values(pointsByDevice).flat(), [pointsByDevice]);
-
-  const mapCenter = useMemo<[number, number]>(() => {
-    const latest = allPoints
-      .slice()
-      .sort(
-        (a, b) =>
-          new Date(a.ts || a.receivedAt || 0).getTime() -
-          new Date(b.ts || b.receivedAt || 0).getTime()
-      )
-      .at(-1);
-
-    if (latest) return [latest.lat, latest.lon];
-    return [32.9565, -96.3893];
-  }, [allPoints]);
-
   const wsDotColor =
     wsStatus === "connected"
       ? "#22c55e"
@@ -528,7 +560,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
   return (
     <div style={{ display: "flex", height: "100vh", width: "100vw", background: "#0b1020" }}>
-      {/* Left sidebar */}
+      {/* Sidebar */}
       <div
         style={{
           width: 360,
@@ -572,7 +604,55 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           {loadStatus === "loading" ? "Loading…" : loadStatus === "error" ? "Error loading data" : "Live map"}
         </div>
 
-        {/* Geofence controls */}
+        {/* Unclaimed devices */}
+        <div style={{ marginTop: 6, marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Unclaimed devices</div>
+
+          {unclaimed.length === 0 ? (
+            <div style={{ color: "#94a3b8", fontSize: 12 }}>None found.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {unclaimed.slice(0, 8).map((d) => (
+                <div
+                  key={d.deviceId}
+                  style={{
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    background: "rgba(255,255,255,0.03)",
+                    padding: 10,
+                  }}
+                >
+                  <div style={{ fontWeight: 800, fontSize: 13, color: "white" }}>{d.deviceId}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
+                    Last seen: {d.lastSeen ? new Date(d.lastSeen).toLocaleString() : "—"}
+                  </div>
+
+                  <button
+                    onClick={() => claimDevice(d.deviceId)}
+                    disabled={claimingId === d.deviceId}
+                    style={{
+                      marginTop: 8,
+                      width: "100%",
+                      borderRadius: 10,
+                      border: "1px solid rgba(34,197,94,0.7)",
+                      background: "rgba(34,197,94,0.12)",
+                      color: "#e5e7eb",
+                      padding: "8px 10px",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: 800,
+                      opacity: claimingId === d.deviceId ? 0.7 : 1,
+                    }}
+                  >
+                    {claimingId === d.deviceId ? "Claiming…" : "Claim to my ranch"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Geofences */}
         <div
           style={{
             borderRadius: 12,
@@ -664,54 +744,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           )}
         </div>
 
-        {/* Unclaimed devices */}
-        <div style={{ marginTop: 6, marginBottom: 14 }}>
-          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Unclaimed devices</div>
-
-          {unclaimed.length === 0 ? (
-            <div style={{ color: "#94a3b8", fontSize: 12 }}>None found.</div>
-          ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {unclaimed.slice(0, 8).map((d) => (
-                <div
-                  key={d.deviceId}
-                  style={{
-                    borderRadius: 12,
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    background: "rgba(255,255,255,0.03)",
-                    padding: 10,
-                  }}
-                >
-                  <div style={{ fontWeight: 800, fontSize: 13, color: "white" }}>{d.deviceId}</div>
-                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
-                    Last seen: {d.lastSeen ? new Date(d.lastSeen).toLocaleString() : "—"}
-                  </div>
-
-                  <button
-                    onClick={() => claimDevice(d.deviceId)}
-                    disabled={claimingId === d.deviceId}
-                    style={{
-                      marginTop: 8,
-                      width: "100%",
-                      borderRadius: 10,
-                      border: "1px solid rgba(34,197,94,0.7)",
-                      background: "rgba(34,197,94,0.12)",
-                      color: "#e5e7eb",
-                      padding: "8px 10px",
-                      cursor: "pointer",
-                      fontSize: 12,
-                      fontWeight: 800,
-                      opacity: claimingId === d.deviceId ? 0.7 : 1,
-                    }}
-                  >
-                    {claimingId === d.deviceId ? "Claiming…" : "Claim to my ranch"}
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
         {/* Claimed devices */}
         <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Devices</div>
 
@@ -729,7 +761,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               const motionColor = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#6b7280";
 
               const bPct = last?.batteryPct ?? null;
-              const isSelected = selectedDevice === id;
 
               return (
                 <button
@@ -739,7 +770,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     width: "100%",
                     textAlign: "left",
                     borderRadius: 12,
-                    border: isSelected ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
+                    border: selectedDevice === id ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
                     background: "rgba(255,255,255,0.03)",
                     padding: 10,
                     cursor: "pointer",
@@ -755,11 +786,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt
-                          ? new Date(last.receivedAt).toLocaleTimeString()
-                          : d.lastSeen
-                          ? new Date(d.lastSeen).toLocaleTimeString()
-                          : "—"}
+                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
                       </div>
                     </div>
 
@@ -801,36 +828,21 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Drawing tools */}
           <FeatureGroup>
             <EditControl
               position="topright"
               onCreated={handleGeofenceCreated as any}
-              draw={{
-                rectangle: false,
-                polyline: false,
-                marker: false,
-                circlemarker: false,
-              }}
-              edit={{
-                edit: false,
-                remove: false,
-              }}
+              draw={{ rectangle: false, polyline: false, marker: false, circlemarker: false }}
+              edit={{ edit: false, remove: false }}
             />
           </FeatureGroup>
 
-          {/* Geofence overlays */}
           {showGeofences &&
             geofences.map((g) => {
               if (g.type === "circle") {
                 if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
                 return (
-                  <Circle
-                    key={g.id}
-                    center={[g.centerLat, g.centerLon]}
-                    radius={g.radiusM}
-                    pathOptions={{ weight: 2 }}
-                  >
+                  <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
                     <Tooltip sticky>{g.name}</Tooltip>
                   </Circle>
                 );
@@ -839,7 +851,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               if (g.type === "polygon") {
                 const latlngs = coercePolygonLatLngs(g.polygon);
                 if (!latlngs || latlngs.length < 3) return null;
-
                 return (
                   <Polygon key={g.id} positions={latlngs} pathOptions={{ weight: 2 }}>
                     <Tooltip sticky>{g.name}</Tooltip>
@@ -850,7 +861,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               return null;
             })}
 
-          {/* Device markers */}
           {devices.map((d) => {
             const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
@@ -875,17 +885,12 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                       🔋 {p.batteryPct != null ? `${p.batteryPct.toFixed(0)}%` : "—"}{" "}
                       {p.batteryV != null ? `(${p.batteryV.toFixed(2)}V)` : ""}
                     </div>
-                    <div>
-                      📶 RSSI/SNR: {p.rssi ?? "—"} / {p.snr ?? "—"}
-                    </div>
-                    {p.temperatureC != null ? <div>🌡️ {p.temperatureC.toFixed(1)}°C</div> : null}
                   </div>
                 </Popup>
               </Marker>
             );
           })}
 
-          {/* Selected route */}
           {routePolyline ? <Polyline positions={routePolyline} /> : null}
         </MapContainer>
 
