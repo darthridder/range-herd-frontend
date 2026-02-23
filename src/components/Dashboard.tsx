@@ -13,8 +13,12 @@ import {
   Circle,
   Polygon,
   Tooltip,
+  FeatureGroup,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+
+import "leaflet-draw/dist/leaflet.draw.css";
+import { EditControl } from "react-leaflet-draw";
 
 import { API_URL, WS_URL } from "../config";
 
@@ -49,7 +53,7 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
-  polygon: any; // stored JSON
+  polygon: any; // JSON in DB
   createdAt?: string;
 };
 
@@ -62,6 +66,7 @@ type DashboardProps = {
   onLogout?: () => void;
 };
 
+// Leaflet default marker icon fix (Vite)
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
   iconRetinaUrl: markerIcon2x,
@@ -108,21 +113,11 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
 function coercePolygonLatLngs(polygon: any): [number, number][] | null {
   if (!polygon) return null;
 
-  // Accept common shapes:
-  // 1) [[lat, lon], [lat, lon], ...]
+  // 1) [[lat, lon], ...]
   if (Array.isArray(polygon) && polygon.length > 0 && Array.isArray(polygon[0])) {
     const first = polygon[0];
-
-    // [[lat, lon], ...]
     if (typeof first[0] === "number" && typeof first[1] === "number") {
       return polygon.map((pair: any) => [Number(pair[0]), Number(pair[1])] as [number, number]);
-    }
-
-    // [[{lat, lon}, ...]]  (nested ring)
-    if (typeof first[0] === "object" && first[0]?.lat != null && first[0]?.lon != null) {
-      return (polygon[0] as any[]).map(
-        (pt: any) => [Number(pt.lat), Number(pt.lon)] as [number, number]
-      );
     }
   }
 
@@ -138,19 +133,26 @@ function coercePolygonLatLngs(polygon: any): [number, number][] | null {
 
   // 3) GeoJSON-ish: { coordinates: [[[lon,lat],...]] }
   if (typeof polygon === "object" && polygon?.coordinates) {
-    const coords = polygon.coordinates;
-    // Expect first ring
-    const ring = coords?.[0];
+    const ring = polygon.coordinates?.[0];
     if (Array.isArray(ring) && ring.length > 0 && Array.isArray(ring[0])) {
       const c0 = ring[0];
       if (typeof c0[0] === "number" && typeof c0[1] === "number") {
-        // GeoJSON is [lon,lat]
+        // GeoJSON is [lon, lat]
         return ring.map((c: any) => [Number(c[1]), Number(c[0])] as [number, number]);
       }
     }
   }
 
   return null;
+}
+
+function polygonLatLngsToDb(latlngs: any): [number, number][] {
+  // Leaflet polygon can be LatLng[] (simple) or LatLng[][] (multi-ring)
+  const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
+  if (!Array.isArray(ring)) return [];
+  return ring
+    .map((p: any) => [Number(p.lat), Number(p.lng)] as [number, number])
+    .filter((pair: any) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
 }
 
 export default function Dashboard({ token, user, onLogout }: DashboardProps) {
@@ -167,6 +169,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   // Geofences
   const [geofences, setGeofences] = useState<Geofence[]>([]);
   const [showGeofences, setShowGeofences] = useState(true);
+  const [geofenceBusy, setGeofenceBusy] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -273,12 +276,108 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         await loadDevices();
         await loadUnclaimed();
         await loadLatestPoints();
-        await loadGeofences();
       } finally {
         setClaimingId(null);
       }
     },
-    [token, loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]
+    [token, loadDevices, loadUnclaimed, loadLatestPoints]
+  );
+
+  const deleteGeofence = useCallback(
+    async (id: string) => {
+      setGeofenceBusy(true);
+      try {
+        const res = await fetch(`${API_URL}/api/geofences/${id}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (!res.ok) {
+          const t = await res.text().catch(() => "");
+          throw new Error(`Delete geofence failed: ${res.status} ${res.statusText} ${t}`);
+        }
+
+        await loadGeofences();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setGeofenceBusy(false);
+      }
+    },
+    [token, loadGeofences]
+  );
+
+  const createGeofence = useCallback(
+    async (payload: any) => {
+      setGeofenceBusy(true);
+      try {
+        const res = await fetch(`${API_URL}/api/geofences`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          const t = await res.text().catch(() => "");
+          throw new Error(`Create geofence failed: ${res.status} ${res.statusText} ${t}`);
+        }
+
+        await loadGeofences();
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setGeofenceBusy(false);
+      }
+    },
+    [token, loadGeofences]
+  );
+
+  // Draw handler (circle + polygon)
+  const handleGeofenceCreated = useCallback(
+    async (e: any) => {
+      const layer = e?.layer as any;
+      if (!layer) return;
+
+      // Circle
+      if (layer instanceof L.Circle && !(layer instanceof (L as any).CircleMarker)) {
+        const center = layer.getLatLng();
+        const radius = layer.getRadius();
+
+        await createGeofence({
+          name: `Circle ${new Date().toLocaleTimeString()}`,
+          type: "circle",
+          centerLat: center.lat,
+          centerLon: center.lng,
+          radiusM: radius,
+          polygon: null,
+        });
+
+        return;
+      }
+
+      // Polygon (exclude rectangle)
+      if (layer instanceof L.Polygon && !(layer instanceof L.Rectangle)) {
+        const latlngs = layer.getLatLngs();
+        const coords = polygonLatLngsToDb(latlngs);
+
+        if (coords.length >= 3) {
+          await createGeofence({
+            name: `Polygon ${new Date().toLocaleTimeString()}`,
+            type: "polygon",
+            centerLat: null,
+            centerLon: null,
+            radiusM: null,
+            polygon: coords,
+          });
+        }
+
+        return;
+      }
+    },
+    [createGeofence]
   );
 
   // Initial load + polling
@@ -306,7 +405,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         await loadDevices();
         await loadUnclaimed();
         await loadLatestPoints();
-        // geofences change less often; refresh every poll anyway is fine
         await loadGeofences();
       } catch (e) {
         console.error("poll error", e);
@@ -353,7 +451,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       console.error("WS connect failed", e);
       setWsStatus("error");
     }
-  }, [loadLatestPoints, loadDevices, loadUnclaimed]);
+  }, [loadLatestPoints, loadDevices, loadUnclaimed, connectWs]);
 
   useEffect(() => {
     connectWs();
@@ -361,9 +459,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
       if (wsRef.current) wsRef.current.close();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connectWs]);
-
-  const deviceIds = useMemo(() => Object.keys(pointsByDevice), [pointsByDevice]);
 
   type MotionState = "moving" | "stationary" | "unknown";
   const motionByDevice = useMemo(() => {
@@ -388,7 +485,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       const d1 = haversineMeters({ lat: p1.lat, lon: p1.lon }, { lat: p2.lat, lon: p2.lon });
       const d2 = haversineMeters({ lat: p2.lat, lon: p2.lon }, { lat: p3.lat, lon: p3.lon });
 
-      out[deviceId] = d1 > MOVEMENT_THRESHOLD_M && d2 > MOVEMENT_THRESHOLD_M ? "moving" : "stationary";
+      out[deviceId] =
+        d1 > MOVEMENT_THRESHOLD_M && d2 > MOVEMENT_THRESHOLD_M ? "moving" : "stationary";
     }
 
     return out;
@@ -435,10 +533,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       {/* Left sidebar */}
       <div
         style={{
-          width: 340,
+          width: 360,
           borderRight: "1px solid rgba(255,255,255,0.08)",
           padding: 14,
           color: "white",
+          overflowY: "auto",
         }}
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
@@ -475,21 +574,96 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           {loadStatus === "loading" ? "Loading…" : loadStatus === "error" ? "Error loading data" : "Live map"}
         </div>
 
-        {/* Geofence toggle */}
-        <div style={{ marginBottom: 12 }}>
-          <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
-            <input
-              type="checkbox"
-              checked={showGeofences}
-              onChange={(e) => setShowGeofences(e.target.checked)}
-            />
-            <span style={{ fontSize: 12, color: "#e5e7eb", fontWeight: 800 }}>Show geofences</span>
-            <span style={{ fontSize: 12, color: "#94a3b8" }}>({geofences.length})</span>
-          </label>
+        {/* Geofence controls */}
+        <div
+          style={{
+            borderRadius: 12,
+            border: "1px solid rgba(255,255,255,0.08)",
+            background: "rgba(255,255,255,0.03)",
+            padding: 12,
+            marginBottom: 12,
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+            <div>
+              <div style={{ fontWeight: 900, fontSize: 13 }}>Geofences</div>
+              <div style={{ fontSize: 11, color: "#94a3b8" }}>
+                Draw on the map (top-right tools). Saved to DB.
+              </div>
+            </div>
+
+            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={showGeofences}
+                onChange={(e) => setShowGeofences(e.target.checked)}
+              />
+              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>
+                Show ({geofences.length})
+              </span>
+            </label>
+          </div>
+
+          {geofences.length > 0 ? (
+            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+              {geofences.slice(0, 10).map((g) => (
+                <div
+                  key={g.id}
+                  style={{
+                    borderRadius: 10,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    padding: 10,
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 10,
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 900, fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                      {g.name}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#94a3b8" }}>
+                      {g.type}
+                      {g.type === "circle" && g.radiusM != null ? ` • ${Math.round(g.radiusM)}m` : ""}
+                    </div>
+                  </div>
+
+                  <button
+                    disabled={geofenceBusy}
+                    onClick={() => deleteGeofence(g.id)}
+                    style={{
+                      borderRadius: 10,
+                      border: "1px solid rgba(239,68,68,0.6)",
+                      background: "rgba(239,68,68,0.10)",
+                      color: "#e5e7eb",
+                      padding: "6px 10px",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: 900,
+                      opacity: geofenceBusy ? 0.7 : 1,
+                      flexShrink: 0,
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+              {geofences.length > 10 ? (
+                <div style={{ fontSize: 11, color: "#94a3b8" }}>
+                  Showing 10 of {geofences.length}
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>
+              No geofences yet. Use the draw tools on the map.
+            </div>
+          )}
         </div>
 
         {/* Unclaimed devices */}
-        <div style={{ marginTop: 10, marginBottom: 14 }}>
+        <div style={{ marginTop: 6, marginBottom: 14 }}>
           <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Unclaimed devices</div>
 
           {unclaimed.length === 0 ? (
@@ -553,7 +727,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               const motionColor = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#6b7280";
 
               const bPct = last?.batteryPct ?? null;
-
               const isSelected = selectedDevice === id;
 
               return (
@@ -613,6 +786,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             })
           )}
         </div>
+
+        <div style={{ height: 20 }} />
+        <div style={{ fontSize: 11, color: "#6b7280" }}>
+          Logged in as: {user?.email ?? "—"}
+        </div>
       </div>
 
       {/* Map */}
@@ -623,7 +801,25 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Geofences overlay */}
+          {/* Drawing tools */}
+          <FeatureGroup>
+            <EditControl
+              position="topright"
+              onCreated={handleGeofenceCreated as any}
+              draw={{
+                rectangle: false,
+                polyline: false,
+                marker: false,
+                circlemarker: false,
+              }}
+              edit={{
+                edit: false,
+                remove: false,
+              }}
+            />
+          </FeatureGroup>
+
+          {/* Geofence overlays */}
           {showGeofences &&
             geofences.map((g) => {
               if (g.type === "circle") {
@@ -654,7 +850,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               return null;
             })}
 
-          {/* Markers for claimed devices */}
+          {/* Device markers */}
           {devices.map((d) => {
             const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
@@ -662,7 +858,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             if (!p) return null;
 
             const motion = motionByDevice[id] ?? "unknown";
-            const color = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
+            const color =
+              motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
             const icon = createColoredIcon(color);
 
             return (
@@ -691,6 +888,26 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           {/* Selected route */}
           {routePolyline ? <Polyline positions={routePolyline} /> : null}
         </MapContainer>
+
+        {/* Tiny “busy” hint */}
+        {geofenceBusy ? (
+          <div
+            style={{
+              position: "absolute",
+              right: 18,
+              bottom: 18,
+              padding: "10px 12px",
+              borderRadius: 12,
+              background: "rgba(0,0,0,0.55)",
+              color: "white",
+              fontSize: 12,
+              fontWeight: 800,
+              border: "1px solid rgba(255,255,255,0.12)",
+            }}
+          >
+            Saving geofence…
+          </div>
+        ) : null}
       </div>
     </div>
   );
