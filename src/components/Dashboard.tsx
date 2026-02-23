@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import L from "leaflet";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";
 import markerIcon from "leaflet/dist/images/marker-icon.png";
@@ -10,12 +10,10 @@ import "leaflet/dist/leaflet.css";
 import { API_URL, WS_URL } from "../config";
 
 type LivePoint = {
-  id?: string;
   deviceId: string;
-
   lat: number;
   lon: number;
-
+  altM?: number | null;
   receivedAt?: string;
   ts?: string;
 
@@ -23,17 +21,16 @@ type LivePoint = {
   batteryV?: number | null;
   rssi?: number | null;
   snr?: number | null;
-
   temperatureC?: number | null;
+  fCnt?: number | null;
 };
 
 type DeviceRow = {
-  id: string;
-  name: string;
-  batteryPct: number | null;
-  lastLat: number | null;
-  lastLon: number | null;
-  lastSeenAt: string | null;
+  deviceId: string;
+  devEui?: string | null;
+  name?: string | null;
+  lastSeen?: string | null;
+  createdAt?: string;
 };
 
 type WsStatus = "connecting" | "connected" | "reconnecting" | "error";
@@ -69,10 +66,7 @@ function createColoredIcon(color: string) {
   });
 }
 
-// ===============================
-// Movement filtering (GPS drift)
-// Mark as MOVING only if last TWO consecutive moves exceed threshold.
-// ===============================
+// Movement filtering: moving only if last 2 consecutive moves exceed threshold
 const MOVEMENT_THRESHOLD_M = 10;
 
 function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon: number }) {
@@ -95,10 +89,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("loading");
 
   const [devices, setDevices] = useState<DeviceRow[]>([]);
+  const [unclaimed, setUnclaimed] = useState<DeviceRow[]>([]);
+  const [claimingId, setClaimingId] = useState<string | null>(null);
+
   const [pointsByDevice, setPointsByDevice] = useState<Record<string, LivePoint[]>>({});
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
-
-  const [alertCenter, setAlertCenter] = useState<[number, number] | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -107,14 +102,13 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   const fetchJson = useCallback(
     async (path: string) => {
       const url = `${API_URL}${path}`;
-
       const headers: Record<string, string> = {};
       if (token) headers.Authorization = `Bearer ${token}`;
 
       const res = await fetch(url, { headers });
 
-      // If auth dies, force logout to re-login cleanly
       if (res.status === 401) {
+        // Token is dead. Force logout so app returns to login.
         try {
           onLogout?.();
         } catch {}
@@ -136,11 +130,17 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     setDevices(data);
   }, [fetchJson]);
 
+  const loadUnclaimed = useCallback(async () => {
+    const data = await fetchJson("/api/devices/unclaimed");
+    setUnclaimed(data);
+  }, [fetchJson]);
+
   const loadLatestPoints = useCallback(async () => {
     const data = await fetchJson("/api/live/latest");
 
     const by: Record<string, LivePoint[]> = {};
     for (const p of data as LivePoint[]) {
+      if (!p?.deviceId) continue;
       if (!by[p.deviceId]) by[p.deviceId] = [];
       by[p.deviceId].push(p);
     }
@@ -152,10 +152,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const existing = merged[id] || [];
         const next = [...existing, ...pts];
 
+        // de-dupe
         const seen = new Set<string>();
         const deduped: LivePoint[] = [];
         for (const x of next) {
-          const key = `${x.ts || x.receivedAt || ""}-${x.lat}-${x.lon}`;
+          const key = `${x.ts || x.receivedAt || ""}-${x.lat}-${x.lon}-${x.fCnt ?? ""}`;
           if (seen.has(key)) continue;
           seen.add(key);
           deduped.push(x);
@@ -167,12 +168,40 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             new Date(b.ts || b.receivedAt || 0).getTime()
         );
 
-        merged[id] = deduped.slice(-60);
+        merged[id] = deduped.slice(-80);
       }
 
       return merged;
     });
   }, [fetchJson]);
+
+  const claimDevice = useCallback(
+    async (deviceId: string) => {
+      setClaimingId(deviceId);
+      try {
+        const res = await fetch(`${API_URL}/api/devices/claim`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ deviceId }),
+        });
+
+        if (!res.ok) {
+          const t = await res.text().catch(() => "");
+          throw new Error(`Claim failed: ${res.status} ${res.statusText} ${t}`);
+        }
+
+        await loadDevices();
+        await loadUnclaimed();
+        await loadLatestPoints();
+      } finally {
+        setClaimingId(null);
+      }
+    },
+    [token, loadDevices, loadUnclaimed, loadLatestPoints]
+  );
 
   // Initial load + polling
   useEffect(() => {
@@ -182,6 +211,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       try {
         setLoadStatus("loading");
         await loadDevices();
+        await loadUnclaimed();
         await loadLatestPoints();
         if (!mounted) return;
         setLoadStatus("ready");
@@ -195,19 +225,20 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     pollTimerRef.current = window.setInterval(async () => {
       try {
         await loadDevices();
+        await loadUnclaimed();
         await loadLatestPoints();
       } catch (e) {
         console.error("poll error", e);
       }
-    }, 60000);
+    }, 30000);
 
     return () => {
       mounted = false;
       if (pollTimerRef.current) window.clearInterval(pollTimerRef.current);
     };
-  }, [loadDevices, loadLatestPoints]);
+  }, [loadDevices, loadUnclaimed, loadLatestPoints]);
 
-  // WebSocket – connect to BACKEND host, not window.location.host
+  // WebSocket – connect to backend
   const connectWs = useCallback(() => {
     try {
       if (wsRef.current) {
@@ -217,36 +248,32 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
       setWsStatus("connecting");
 
-      // Backend has /api/live websocket route
       const ws = new WebSocket(`${WS_URL}/api/live`);
       wsRef.current = ws;
 
       ws.onopen = () => setWsStatus("connected");
 
-      ws.onmessage = async (evt) => {
+      ws.onmessage = async () => {
+        // On any message, refresh latest
         try {
-          const msg = JSON.parse(evt.data || "{}");
-          if (msg?.type === "live_point" || msg?.type === "tick" || msg?.type === "ttn_uplink") {
-            await loadLatestPoints();
-            await loadDevices();
-          }
-        } catch {
-          // ignore
-        }
+          await loadLatestPoints();
+          await loadDevices();
+          await loadUnclaimed();
+        } catch {}
       };
 
       ws.onerror = () => setWsStatus("error");
 
       ws.onclose = () => {
         setWsStatus("reconnecting");
-        if (reconnectTimerRef.current) window.clearInterval(reconnectTimerRef.current);
+        if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = window.setTimeout(() => connectWs(), 1500) as any;
       };
     } catch (e) {
       console.error("WS connect failed", e);
       setWsStatus("error");
     }
-  }, [loadLatestPoints, loadDevices]);
+  }, [loadLatestPoints, loadDevices, loadUnclaimed]);
 
   useEffect(() => {
     connectWs();
@@ -256,25 +283,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [connectWs]);
 
-  const allPoints = useMemo(() => Object.values(pointsByDevice).flat(), [pointsByDevice]);
-
-  const mapCenter = useMemo<[number, number]>(() => {
-    if (alertCenter) return alertCenter;
-
-    const latest = allPoints
-      .slice()
-      .sort(
-        (a, b) =>
-          new Date(a.ts || a.receivedAt || 0).getTime() -
-          new Date(b.ts || b.receivedAt || 0).getTime()
-      )
-      .at(-1);
-
-    if (latest) return [latest.lat, latest.lon];
-    return [32.9565, -96.3893];
-  }, [alertCenter, allPoints]);
-
-  const deviceIds = Object.keys(pointsByDevice);
+  const deviceIds = useMemo(() => Object.keys(pointsByDevice), [pointsByDevice]);
 
   type MotionState = "moving" | "stationary" | "unknown";
   const motionByDevice = useMemo(() => {
@@ -316,6 +325,22 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     return selectedPoints.map((p) => [p.lat, p.lon]) as [number, number][];
   }, [selectedDevice, selectedPoints]);
 
+  const allPoints = useMemo(() => Object.values(pointsByDevice).flat(), [pointsByDevice]);
+
+  const mapCenter = useMemo<[number, number]>(() => {
+    const latest = allPoints
+      .slice()
+      .sort(
+        (a, b) =>
+          new Date(a.ts || a.receivedAt || 0).getTime() -
+          new Date(b.ts || b.receivedAt || 0).getTime()
+      )
+      .at(-1);
+
+    if (latest) return [latest.lat, latest.lon];
+    return [32.9565, -96.3893];
+  }, [allPoints]);
+
   const wsDotColor =
     wsStatus === "connected"
       ? "#22c55e"
@@ -330,7 +355,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       {/* Left sidebar */}
       <div
         style={{
-          width: 320,
+          width: 340,
           borderRight: "1px solid rgba(255,255,255,0.08)",
           padding: 14,
           color: "white",
@@ -365,28 +390,79 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           </div>
         </div>
 
-        <div style={{ height: 12 }} />
-
+        <div style={{ height: 10 }} />
         <div style={{ fontSize: 12, color: "#cbd5e1", opacity: 0.9, marginBottom: 10 }}>
           {loadStatus === "loading" ? "Loading…" : loadStatus === "error" ? "Error loading data" : "Live map"}
         </div>
 
+        {/* Unclaimed devices */}
+        <div style={{ marginTop: 10, marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Unclaimed devices</div>
+
+          {unclaimed.length === 0 ? (
+            <div style={{ color: "#94a3b8", fontSize: 12 }}>None found.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {unclaimed.slice(0, 8).map((d) => (
+                <div
+                  key={d.deviceId}
+                  style={{
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,0.08)",
+                    background: "rgba(255,255,255,0.03)",
+                    padding: 10,
+                  }}
+                >
+                  <div style={{ fontWeight: 800, fontSize: 13, color: "white" }}>{d.deviceId}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 4 }}>
+                    Last seen: {d.lastSeen ? new Date(d.lastSeen).toLocaleString() : "—"}
+                  </div>
+
+                  <button
+                    onClick={() => claimDevice(d.deviceId)}
+                    disabled={claimingId === d.deviceId}
+                    style={{
+                      marginTop: 8,
+                      width: "100%",
+                      borderRadius: 10,
+                      border: "1px solid rgba(34,197,94,0.7)",
+                      background: "rgba(34,197,94,0.12)",
+                      color: "#e5e7eb",
+                      padding: "8px 10px",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: 800,
+                      opacity: claimingId === d.deviceId ? 0.7 : 1,
+                    }}
+                  >
+                    {claimingId === d.deviceId ? "Claiming…" : "Claim to my ranch"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Claimed devices */}
         <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Devices</div>
 
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {deviceIds.length === 0 ? (
+          {devices.length === 0 ? (
             <div style={{ color: "#94a3b8", fontSize: 12 }}>No devices yet.</div>
           ) : (
-            deviceIds.map((id) => {
+            devices.map((d) => {
+              const id = d.deviceId;
               const pts = pointsByDevice[id] || [];
               const last = pts[pts.length - 1];
-              const bPct = last?.batteryPct ?? null;
 
               const motion = motionByDevice[id] ?? "unknown";
               const motionLabel = motion === "moving" ? "Moving" : motion === "stationary" ? "Stationary" : "—";
               const motionColor = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#6b7280";
 
+              const bPct = last?.batteryPct ?? null;
+
               const isSelected = selectedDevice === id;
+
               return (
                 <button
                   key={id}
@@ -403,7 +479,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                   }}
                 >
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                    <div style={{ fontWeight: 800, fontSize: 13 }}>{id}</div>
+                    <div style={{ fontWeight: 800, fontSize: 13 }}>{d.name || id}</div>
                     <div style={{ fontSize: 12, color: "#cbd5e1" }}>{bPct != null ? `${bPct.toFixed(0)}%` : "—"}</div>
                   </div>
 
@@ -413,18 +489,15 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
                         {last?.receivedAt
                           ? new Date(last.receivedAt).toLocaleTimeString()
-                          : last?.ts
-                          ? new Date(last.ts).toLocaleTimeString()
+                          : d.lastSeen
+                          ? new Date(d.lastSeen).toLocaleTimeString()
                           : "—"}
                       </div>
                     </div>
 
                     <div>
-                      <div style={{ color: "#6b7280", fontSize: 11 }}>Battery</div>
-                      <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.batteryPct != null ? `${last.batteryPct.toFixed(0)}%` : "—"}{" "}
-                        {last?.batteryV != null ? `(${last.batteryV.toFixed(2)}V)` : ""}
-                      </div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>Status</div>
+                      <div style={{ color: motionColor, fontWeight: 800, fontSize: 12 }}>{motionLabel}</div>
                     </div>
 
                     <div>
@@ -435,16 +508,12 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     </div>
 
                     <div>
-                      <div style={{ color: "#6b7280", fontSize: 11 }}>Status</div>
-                      <div style={{ color: motionColor, fontWeight: 700 }}>{motionLabel}</div>
-                    </div>
-
-                    {last?.temperatureC != null ? (
-                      <div>
-                        <div style={{ color: "#6b7280", fontSize: 11 }}>Temp</div>
-                        <div style={{ color: "#e5e7eb", fontSize: 11 }}>{last.temperatureC.toFixed(1)}°C</div>
+                      <div style={{ color: "#6b7280", fontSize: 11 }}>Battery</div>
+                      <div style={{ color: "#e5e7eb", fontSize: 11 }}>
+                        {last?.batteryPct != null ? `${last.batteryPct.toFixed(0)}%` : "—"}{" "}
+                        {last?.batteryV != null ? `(${last.batteryV.toFixed(2)}V)` : ""}
                       </div>
-                    ) : null}
+                    </div>
                   </div>
                 </button>
               );
@@ -461,8 +530,9 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Device markers */}
-          {deviceIds.map((id) => {
+          {/* Markers for claimed devices */}
+          {devices.map((d) => {
+            const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
             const p = pts[pts.length - 1];
             if (!p) return null;
@@ -475,9 +545,9 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               <Marker key={id} position={[p.lat, p.lon]} icon={icon}>
                 <Popup>
                   <div style={{ minWidth: 220 }}>
-                    <div style={{ fontWeight: 800 }}>{id}</div>
-                    <div>🕐 {p.receivedAt ? new Date(p.receivedAt).toLocaleString() : p.ts ? new Date(p.ts).toLocaleString() : "—"}</div>
-                    <div>📍 Status: {motion === "moving" ? "Moving" : motion === "stationary" ? "Stationary" : "—"}</div>
+                    <div style={{ fontWeight: 900 }}>{d.name || id}</div>
+                    <div>🕐 {p.receivedAt ? new Date(p.receivedAt).toLocaleString() : "—"}</div>
+                    <div>📍 {p.lat.toFixed(5)}, {p.lon.toFixed(5)}</div>
                     <div>🔋 {p.batteryPct != null ? `${p.batteryPct.toFixed(0)}%` : "—"} {p.batteryV != null ? `(${p.batteryV.toFixed(2)}V)` : ""}</div>
                     <div>📶 RSSI/SNR: {p.rssi ?? "—"} / {p.snr ?? "—"}</div>
                     {p.temperatureC != null ? <div>🌡️ {p.temperatureC.toFixed(1)}°C</div> : null}
