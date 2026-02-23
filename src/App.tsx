@@ -3,44 +3,48 @@ import Login from "./components/Login";
 import Register from "./components/Register";
 import Dashboard from "./components/Dashboard";
 
-console.log("VITE_API_URL from Vite =", import.meta.env.VITE_API_URL);
-
-
 type AuthView = "login" | "register" | "dashboard";
 
 export default function App() {
   const [view, setView] = useState<AuthView>("login");
   const [user, setUser] = useState<any>(null);
+  const [token, setToken] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Check if user is already logged in
   useEffect(() => {
-    const token = localStorage.getItem("token");
+    const t = localStorage.getItem("token");
     const storedUser = localStorage.getItem("user");
 
-    if (token && storedUser) {
+    if (t && storedUser) {
       try {
+        setToken(t);
         setUser(JSON.parse(storedUser));
         setView("dashboard");
       } catch {
         localStorage.removeItem("token");
         localStorage.removeItem("user");
+        setToken(null);
+        setUser(null);
+        setView("login");
       }
     }
 
     setLoading(false);
   }, []);
 
-  const handleLogin = (token: string, userData: any) => {
-    localStorage.setItem("token", token);
+  const handleLogin = (newToken: string, userData: any) => {
+    localStorage.setItem("token", newToken);
     localStorage.setItem("user", JSON.stringify(userData));
+    setToken(newToken);
     setUser(userData);
     setView("dashboard");
   };
 
-  const handleRegister = (token: string, userData: any) => {
-    localStorage.setItem("token", token);
+  const handleRegister = (newToken: string, userData: any) => {
+    localStorage.setItem("token", newToken);
     localStorage.setItem("user", JSON.stringify(userData));
+    setToken(newToken);
     setUser(userData);
     setView("dashboard");
   };
@@ -48,6 +52,7 @@ export default function App() {
   const handleLogout = () => {
     localStorage.removeItem("token");
     localStorage.removeItem("user");
+    setToken(null);
     setUser(null);
     setView("login");
   };
@@ -81,5 +86,11 @@ export default function App() {
     return <Register onRegister={handleRegister} onSwitchToLogin={() => setView("login")} />;
   }
 
-  return <Dashboard user={user} onLogout={handleLogout} />;
+  // Safety: if token missing, force login
+  if (!token) {
+    setView("login");
+    return null;
+  }
+
+  return <Dashboard token={token} user={user} onLogout={handleLogout} />;
 }

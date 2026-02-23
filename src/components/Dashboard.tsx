@@ -7,6 +7,8 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 import { MapContainer, TileLayer, Marker, Polyline, Popup } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
+import { API_URL, WS_URL } from "../config";
+
 type LivePoint = {
   id?: string;
   deviceId: string;
@@ -39,6 +41,8 @@ type LoadStatus = "loading" | "ready" | "error";
 
 type DashboardProps = {
   token: string;
+  user?: any;
+  onLogout?: () => void;
 };
 
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -86,7 +90,7 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-export default function Dashboard({ token }: DashboardProps) {
+export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("loading");
 
@@ -100,21 +104,31 @@ export default function Dashboard({ token }: DashboardProps) {
   const reconnectTimerRef = useRef<number | null>(null);
   const pollTimerRef = useRef<number | null>(null);
 
-  const apiUrl = (import.meta as any).env?.VITE_API_URL || "";
-
   const fetchJson = useCallback(
     async (path: string) => {
-      const url = apiUrl ? `${apiUrl}${path}` : path;
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const url = `${API_URL}${path}`;
+
+      const headers: Record<string, string> = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
+
+      const res = await fetch(url, { headers });
+
+      // If auth dies, force logout to re-login cleanly
+      if (res.status === 401) {
+        try {
+          onLogout?.();
+        } catch {}
+        throw new Error("401 Unauthorized");
+      }
+
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         throw new Error(`${res.status} ${res.statusText} ${text}`);
       }
+
       return res.json();
     },
-    [apiUrl, token]
+    [token, onLogout]
   );
 
   const loadDevices = useCallback(async () => {
@@ -124,20 +138,20 @@ export default function Dashboard({ token }: DashboardProps) {
 
   const loadLatestPoints = useCallback(async () => {
     const data = await fetchJson("/api/live/latest");
-    // expected: array of latest points
+
     const by: Record<string, LivePoint[]> = {};
     for (const p of data as LivePoint[]) {
       if (!by[p.deviceId]) by[p.deviceId] = [];
       by[p.deviceId].push(p);
     }
+
     setPointsByDevice((prev) => {
-      // merge with previous history (keep last N per device)
       const merged: Record<string, LivePoint[]> = { ...prev };
+
       for (const [id, pts] of Object.entries(by)) {
         const existing = merged[id] || [];
         const next = [...existing, ...pts];
 
-        // de-dup by timestamp+coords if repeated
         const seen = new Set<string>();
         const deduped: LivePoint[] = [];
         for (const x of next) {
@@ -147,15 +161,20 @@ export default function Dashboard({ token }: DashboardProps) {
           deduped.push(x);
         }
 
-        // sort and keep last 60 points (adjust if you want)
-        deduped.sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime());
+        deduped.sort(
+          (a, b) =>
+            new Date(a.ts || a.receivedAt || 0).getTime() -
+            new Date(b.ts || b.receivedAt || 0).getTime()
+        );
+
         merged[id] = deduped.slice(-60);
       }
+
       return merged;
     });
   }, [fetchJson]);
 
-  // Initial load + polling (your UI updating every ~30s comes from this)
+  // Initial load + polling
   useEffect(() => {
     let mounted = true;
 
@@ -173,7 +192,6 @@ export default function Dashboard({ token }: DashboardProps) {
       }
     })();
 
-    // poll latest every 60s (adjust to 5s / 10s if you want more “live”)
     pollTimerRef.current = window.setInterval(async () => {
       try {
         await loadDevices();
@@ -189,7 +207,7 @@ export default function Dashboard({ token }: DashboardProps) {
     };
   }, [loadDevices, loadLatestPoints]);
 
-  // WebSocket (optional) – keeps the “connected” indicator and lets server nudge updates
+  // WebSocket – connect to BACKEND host, not window.location.host
   const connectWs = useCallback(() => {
     try {
       if (wsRef.current) {
@@ -199,32 +217,25 @@ export default function Dashboard({ token }: DashboardProps) {
 
       setWsStatus("connecting");
 
-      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const wsUrl = `${protocol}://${window.location.host}/live`;
-
-      const ws = new WebSocket(wsUrl);
+      // Backend has /api/live websocket route
+      const ws = new WebSocket(`${WS_URL}/api/live`);
       wsRef.current = ws;
 
-      ws.onopen = () => {
-        setWsStatus("connected");
-      };
+      ws.onopen = () => setWsStatus("connected");
 
       ws.onmessage = async (evt) => {
         try {
           const msg = JSON.parse(evt.data || "{}");
-          // If backend broadcasts “live_point” or “tick”, refresh latest immediately
           if (msg?.type === "live_point" || msg?.type === "tick" || msg?.type === "ttn_uplink") {
             await loadLatestPoints();
             await loadDevices();
           }
-        } catch (e) {
+        } catch {
           // ignore
         }
       };
 
-      ws.onerror = () => {
-        setWsStatus("error");
-      };
+      ws.onerror = () => setWsStatus("error");
 
       ws.onclose = () => {
         setWsStatus("reconnecting");
@@ -249,13 +260,18 @@ export default function Dashboard({ token }: DashboardProps) {
 
   const mapCenter = useMemo<[number, number]>(() => {
     if (alertCenter) return alertCenter;
+
     const latest = allPoints
       .slice()
-      .sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime())
+      .sort(
+        (a, b) =>
+          new Date(a.ts || a.receivedAt || 0).getTime() -
+          new Date(b.ts || b.receivedAt || 0).getTime()
+      )
       .at(-1);
 
     if (latest) return [latest.lat, latest.lon];
-    return [32.9565, -96.3893]; // default
+    return [32.9565, -96.3893];
   }, [alertCenter, allPoints]);
 
   const deviceIds = Object.keys(pointsByDevice);
@@ -265,13 +281,17 @@ export default function Dashboard({ token }: DashboardProps) {
     const out: Record<string, MotionState> = {};
 
     for (const [deviceId, pts] of Object.entries(pointsByDevice)) {
-      // Need 3 points to evaluate TWO consecutive moves (p1->p2 and p2->p3)
       if (!pts || pts.length < 3) {
         out[deviceId] = "unknown";
         continue;
       }
 
-      const sorted = [...pts].sort((a, b) => new Date(a.ts || a.receivedAt || 0).getTime() - new Date(b.ts || b.receivedAt || 0).getTime());
+      const sorted = [...pts].sort(
+        (a, b) =>
+          new Date(a.ts || a.receivedAt || 0).getTime() -
+          new Date(b.ts || b.receivedAt || 0).getTime()
+      );
+
       const p1 = sorted[sorted.length - 3];
       const p2 = sorted[sorted.length - 2];
       const p3 = sorted[sorted.length - 1];
@@ -292,12 +312,18 @@ export default function Dashboard({ token }: DashboardProps) {
 
   const routePolyline = useMemo(() => {
     if (!selectedDevice) return null;
-    const pts = selectedPoints;
-    if (pts.length < 2) return null;
-    return pts.map((p) => [p.lat, p.lon]) as [number, number][];
+    if (selectedPoints.length < 2) return null;
+    return selectedPoints.map((p) => [p.lat, p.lon]) as [number, number][];
   }, [selectedDevice, selectedPoints]);
 
-  const wsDotColor = wsStatus === "connected" ? "#22c55e" : wsStatus === "reconnecting" ? "#f59e0b" : wsStatus === "error" ? "#ef4444" : "#9ca3af";
+  const wsDotColor =
+    wsStatus === "connected"
+      ? "#22c55e"
+      : wsStatus === "reconnecting"
+      ? "#f59e0b"
+      : wsStatus === "error"
+      ? "#ef4444"
+      : "#9ca3af";
 
   return (
     <div style={{ display: "flex", height: "100vh", width: "100vw", background: "#0b1020" }}>
@@ -312,9 +338,30 @@ export default function Dashboard({ token }: DashboardProps) {
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
           <div style={{ fontSize: 18, fontWeight: 800 }}>Range Herd</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div style={{ width: 8, height: 8, borderRadius: 50, background: wsDotColor }} />
-            <div style={{ fontSize: 12, color: "#cbd5e1" }}>{wsStatus}</div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {onLogout ? (
+              <button
+                onClick={onLogout}
+                style={{
+                  background: "rgba(255,255,255,0.06)",
+                  border: "1px solid rgba(255,255,255,0.10)",
+                  color: "#e5e7eb",
+                  borderRadius: 10,
+                  padding: "6px 10px",
+                  cursor: "pointer",
+                  fontSize: 12,
+                  fontWeight: 700,
+                }}
+              >
+                Logout
+              </button>
+            ) : null}
+
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ width: 8, height: 8, borderRadius: 50, background: wsDotColor }} />
+              <div style={{ fontSize: 12, color: "#cbd5e1" }}>{wsStatus}</div>
+            </div>
           </div>
         </div>
 
@@ -364,7 +411,11 @@ export default function Dashboard({ token }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : last?.ts ? new Date(last.ts).toLocaleTimeString() : "—"}
+                        {last?.receivedAt
+                          ? new Date(last.receivedAt).toLocaleTimeString()
+                          : last?.ts
+                          ? new Date(last.ts).toLocaleTimeString()
+                          : "—"}
                       </div>
                     </div>
 
@@ -426,9 +477,7 @@ export default function Dashboard({ token }: DashboardProps) {
                   <div style={{ minWidth: 220 }}>
                     <div style={{ fontWeight: 800 }}>{id}</div>
                     <div>🕐 {p.receivedAt ? new Date(p.receivedAt).toLocaleString() : p.ts ? new Date(p.ts).toLocaleString() : "—"}</div>
-                    <div>
-                      📍 Status: {(motionByDevice[id] ?? "unknown") === "moving" ? "Moving" : (motionByDevice[id] ?? "unknown") === "stationary" ? "Stationary" : "—"}
-                    </div>
+                    <div>📍 Status: {motion === "moving" ? "Moving" : motion === "stationary" ? "Stationary" : "—"}</div>
                     <div>🔋 {p.batteryPct != null ? `${p.batteryPct.toFixed(0)}%` : "—"} {p.batteryV != null ? `(${p.batteryV.toFixed(2)}V)` : ""}</div>
                     <div>📶 RSSI/SNR: {p.rssi ?? "—"} / {p.snr ?? "—"}</div>
                     {p.temperatureC != null ? <div>🌡️ {p.temperatureC.toFixed(1)}°C</div> : null}
