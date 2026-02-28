@@ -922,7 +922,23 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
   // Polygon fences stored as GeoJSON geometry (Polygon or MultiPolygon)
   if (gf.type === "polygon" && gf.polygon?.type && gf.polygon?.coordinates) {
-    return <GeoJSON key={gf.id} data={gf.polygon} />;
+   const feature = {
+  type: "Feature",
+  properties: { id: gf.id, name: gf.name },
+  geometry: gf.polygon,
+};
+
+return (
+  <GeoJSON
+    key={gf.id}
+    data={feature as any}
+    coordsToLatLng={(coords: any) => {
+      const lon = coords[0];
+      const lat = coords[1];
+      return L.latLng(lat, lon);
+    }}
+  />
+);
   }
 
   return null;
