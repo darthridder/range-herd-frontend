@@ -14,7 +14,6 @@ import {
   Polygon,
   Tooltip,
   FeatureGroup,
-  GeoJSON
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -55,7 +54,12 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
+
+  // Can be:
+  // - GeoJSON Geometry: { type:"Polygon"|"MultiPolygon", coordinates: ... }
+  // - Legacy array formats: [[lat,lon], ...] or [{lat,lon}, ...]
   polygon: any;
+
   createdAt?: string;
 };
 
@@ -95,9 +99,6 @@ function createColoredIcon(color: string) {
 
 /**
  * Motion detection tuning:
- * - Increase threshold to beat GPS drift
- * - Require recent points
- * - Require reasonable speed (distance / time)
  */
 const MOVEMENT_THRESHOLD_M = 25;
 const RECENT_WINDOW_MS = 5 * 60_000;
@@ -124,34 +125,86 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-// ---- Geofence helpers ----
-function coercePolygonLatLngs(polygon: any): [number, number][] | null {
+/* ============================================================
+   GEOFENCE HELPERS
+   - Supports GeoJSON Polygon/MultiPolygon geometry objects
+   - Supports legacy array formats
+============================================================ */
+
+// Legacy: [[lat,lon], ...] or [{lat,lon}, ...]
+function coerceLegacyPolygonLatLngs(polygon: any): [number, number][] | null {
   if (!polygon) return null;
 
+  // [[lat, lon], ...]
   if (Array.isArray(polygon) && polygon.length > 0 && Array.isArray(polygon[0])) {
     const first = polygon[0];
     if (typeof first[0] === "number" && typeof first[1] === "number") {
-      return polygon.map((pair: any) => [Number(pair[0]), Number(pair[1])] as [number, number]);
+      return polygon
+        .map((pair: any) => [Number(pair[0]), Number(pair[1])] as [number, number])
+        .filter((p: any) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
     }
   }
 
+  // [{lat, lon}, ...]
   if (Array.isArray(polygon) && polygon.length > 0 && typeof polygon[0] === "object") {
     const pt = polygon[0];
     if (pt?.lat != null && pt?.lon != null) {
-      return (polygon as any[]).map(
-        (x: any) => [Number(x.lat), Number(x.lon)] as [number, number]
-      );
+      return (polygon as any[])
+        .map((x: any) => [Number(x.lat), Number(x.lon)] as [number, number])
+        .filter((p: any) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
     }
   }
 
-  if (typeof polygon === "object" && polygon?.coordinates) {
-    const ring = polygon.coordinates?.[0];
-    if (Array.isArray(ring) && ring.length > 0 && Array.isArray(ring[0])) {
-      const c0 = ring[0];
-      if (typeof c0[0] === "number" && typeof c0[1] === "number") {
-        return ring.map((c: any) => [Number(c[1]), Number(c[0])] as [number, number]);
-      }
-    }
+  return null;
+}
+
+// Convert GeoJSON geometry to react-leaflet Polygon "positions"
+// Polygon:    [ [ [lon,lat], ... ] , holes... ]
+// MultiPolygon: [ [ [ [lon,lat], ... ] , holes... ], ... ]
+function geoJsonGeometryToPositions(geom: any): any | null {
+  if (!geom || typeof geom !== "object") return null;
+
+  const t = String(geom.type ?? "");
+  const coords = geom.coordinates;
+
+  const swap = (pt: any): [number, number] | null => {
+    // Expect [lon,lat] or [lon,lat,alt...]
+    if (!Array.isArray(pt) || pt.length < 2) return null;
+    const lon = Number(pt[0]);
+    const lat = Number(pt[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return [lat, lon];
+  };
+
+  if (t === "Polygon") {
+    if (!Array.isArray(coords)) return null;
+    const rings = coords
+      .map((ring: any) => (Array.isArray(ring) ? ring.map(swap).filter(Boolean) : []))
+      .filter((ring: any) => ring.length >= 3);
+    if (rings.length === 0) return null;
+
+    // react-leaflet Polygon supports: LatLngExpression[] | LatLngExpression[][]
+    // If multiple rings (holes), pass array of rings
+    return rings.length === 1 ? rings[0] : rings;
+  }
+
+  if (t === "MultiPolygon") {
+    if (!Array.isArray(coords)) return null;
+    const polys = coords
+      .map((poly: any) => {
+        if (!Array.isArray(poly)) return null;
+        const rings = poly
+          .map((ring: any) => (Array.isArray(ring) ? ring.map(swap).filter(Boolean) : []))
+          .filter((ring: any) => ring.length >= 3);
+        if (rings.length === 0) return null;
+        return rings.length === 1 ? rings[0] : rings;
+      })
+      .filter(Boolean);
+
+    if (polys.length === 0) return null;
+
+    // react-leaflet Polygon supports multipolygon as LatLngExpression[][][]
+    return polys;
   }
 
   return null;
@@ -366,6 +419,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const coords = polygonLatLngsToDb(latlngs);
 
         if (coords.length >= 3) {
+          // Keep legacy array format for drawn polygons (works with backend too)
           await createGeofence({
             name: `Polygon ${new Date().toLocaleTimeString()}`,
             type: "polygon",
@@ -417,7 +471,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // WebSocket connect (no self reference)
+  // WebSocket connect
   useEffect(() => {
     let stopped = false;
 
@@ -442,8 +496,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
         ws.onmessage = async (event) => {
           try {
-            // Parse WS payload if present (server sends {type:"uplink"|"alert", data:...})
-            // but keep backward-compatible behavior by falling back to polling.
             const raw = event?.data;
 
             if (typeof raw === "string") {
@@ -741,11 +793,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={showGeofences}
-                onChange={(e) => setShowGeofences(e.target.checked)}
-              />
+              <input type="checkbox" checked={showGeofences} onChange={(e) => setShowGeofences(e.target.checked)} />
               <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>
                 Show ({geofences.length})
               </span>
@@ -810,9 +858,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               ) : null}
             </div>
           ) : (
-            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>
-              No geofences yet. Use the draw tools on the map.
-            </div>
+            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>No geofences yet. Use the draw tools.</div>
           )}
         </div>
 
@@ -845,7 +891,10 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     width: "100%",
                     textAlign: "left",
                     borderRadius: 12,
-                    border: selectedDevice === id ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
+                    border:
+                      selectedDevice === id
+                        ? "1px solid rgba(34,197,94,0.9)"
+                        : "1px solid rgba(255,255,255,0.08)",
                     background: "rgba(255,255,255,0.03)",
                     padding: 10,
                     cursor: "pointer",
@@ -861,7 +910,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
+                        {last?.receivedAt
+                          ? new Date(last.receivedAt).toLocaleTimeString()
+                          : d.lastSeen
+                          ? new Date(d.lastSeen).toLocaleTimeString()
+                          : "—"}
                       </div>
                     </div>
 
@@ -902,47 +955,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          {/* ───────────── Geofences (Property Boundary + others) ───────────── */}
-{geofences?.map((gf: any) => {
-  // Circle fences
-  if (
-    gf.type === "circle" &&
-    gf.centerLat != null &&
-    gf.centerLon != null &&
-    gf.radiusM != null
-  ) {
-    return (
-      <Circle
-        key={gf.id}
-        center={[gf.centerLat, gf.centerLon]}
-        radius={gf.radiusM}
-      />
-    );
-  }
 
-  // Polygon fences stored as GeoJSON geometry (Polygon or MultiPolygon)
-  if (gf.type === "polygon" && gf.polygon?.type && gf.polygon?.coordinates) {
-   const feature = {
-  type: "Feature",
-  properties: { id: gf.id, name: gf.name },
-  geometry: gf.polygon,
-};
-
-return (
-  <GeoJSON
-    key={gf.id}
-    data={feature as any}
-    coordsToLatLng={(coords: any) => {
-      const lon = coords[0];
-      const lat = coords[1];
-      return L.latLng(lat, lon);
-    }}
-  />
-);
-  }
-
-  return null;
-})}
+          {/* Draw tools */}
           <FeatureGroup>
             <EditControl
               position="topright"
@@ -952,30 +966,47 @@ return (
             />
           </FeatureGroup>
 
-          {showGeofences &&
-            geofences.map((g) => {
-              if (g.type === "circle") {
-                if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
-                return (
-                  <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
-                    <Tooltip sticky>{g.name}</Tooltip>
-                  </Circle>
-                );
-              }
+          {/* Geofences */}
+          {showGeofences
+            ? geofences.map((g) => {
+                if (g.type === "circle") {
+                  if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
+                  return (
+                    <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
+                      <Tooltip sticky>{g.name}</Tooltip>
+                    </Circle>
+                  );
+                }
 
-              if (g.type === "polygon") {
-                const latlngs = coercePolygonLatLngs(g.polygon);
-                if (!latlngs || latlngs.length < 3) return null;
-                return (
-                  <Polygon key={g.id} positions={latlngs} pathOptions={{ weight: 2 }}>
-                    <Tooltip sticky>{g.name}</Tooltip>
-                  </Polygon>
-                );
-              }
+                if (g.type === "polygon") {
+                  // Prefer GeoJSON geometry if present
+                  const positionsFromGeo = geoJsonGeometryToPositions(g.polygon);
+                  if (positionsFromGeo) {
+                    return (
+                      <Polygon key={g.id} positions={positionsFromGeo as any} pathOptions={{ weight: 2 }}>
+                        <Tooltip sticky>{g.name}</Tooltip>
+                      </Polygon>
+                    );
+                  }
 
-              return null;
-            })}
+                  // Fallback: legacy array formats
+                  const legacy = coerceLegacyPolygonLatLngs(g.polygon);
+                  if (legacy && legacy.length >= 3) {
+                    return (
+                      <Polygon key={g.id} positions={legacy} pathOptions={{ weight: 2 }}>
+                        <Tooltip sticky>{g.name}</Tooltip>
+                      </Polygon>
+                    );
+                  }
 
+                  return null;
+                }
+
+                return null;
+              })
+            : null}
+
+          {/* Devices */}
           {devices.map((d) => {
             const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
@@ -983,8 +1014,7 @@ return (
             if (!p) return null;
 
             const motion = motionByDevice[id] ?? "unknown";
-            const color =
-              motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
+            const color = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
             const icon = createColoredIcon(color);
 
             return (
