@@ -8,12 +8,12 @@ import {
   MapContainer,
   TileLayer,
   Marker,
-  Polyline,
   Popup,
   Circle,
   Polygon,
   Tooltip,
   FeatureGroup,
+  GeoJSON
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
