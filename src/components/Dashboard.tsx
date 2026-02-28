@@ -21,6 +21,7 @@ import "leaflet-draw/dist/leaflet.draw.css";
 import { EditControl } from "react-leaflet-draw";
 
 import { API_URL, WS_URL } from "../config";
+import AlertsPanel, { type AlertRow } from "./AlertsPanel";
 
 type LivePoint = {
   deviceId: string;
@@ -177,6 +178,9 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
   const [geofences, setGeofences] = useState<Geofence[]>([]);
   const [showGeofences, setShowGeofences] = useState(true);
   const [geofenceBusy, setGeofenceBusy] = useState(false);
+
+  const [incomingAlert, setIncomingAlert] = useState<AlertRow | null>(null);
+  const [toastAlert, setToastAlert] = useState<AlertRow | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -435,12 +439,35 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
           setWsStatus("connected");
         };
 
-        ws.onmessage = async () => {
+        ws.onmessage = async (event) => {
           try {
+            // Parse WS payload if present (server sends {type:"uplink"|"alert", data:...})
+            // but keep backward-compatible behavior by falling back to polling.
+            const raw = event?.data;
+
+            if (typeof raw === "string") {
+              try {
+                const msg = JSON.parse(raw);
+
+                if (msg?.type === "alert" && msg?.data) {
+                  const a = msg.data as AlertRow;
+                  setIncomingAlert(a);
+                  setToastAlert(a);
+                  window.setTimeout(() => {
+                    setToastAlert((cur) => (cur?.id === a.id ? null : cur));
+                  }, 8000);
+                }
+              } catch {
+                // ignore parse errors
+              }
+            }
+
             await loadLatestPoints();
             await loadDevices();
             await loadUnclaimed();
-          } catch {}
+          } catch {
+            // ignore
+          }
         };
 
         ws.onerror = () => {
@@ -560,6 +587,50 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
   return (
     <div style={{ display: "flex", height: "100vh", width: "100vw", background: "#0b1020" }}>
+      {/* Toast */}
+      {toastAlert ? (
+        <div
+          style={{
+            position: "fixed",
+            top: 16,
+            right: 16,
+            zIndex: 9999,
+            maxWidth: 420,
+            borderRadius: 14,
+            border: "1px solid rgba(255,255,255,0.16)",
+            background: "rgba(15,17,23,0.92)",
+            color: "#e5e7eb",
+            padding: 14,
+            boxShadow: "0 18px 50px rgba(0,0,0,0.35)",
+            backdropFilter: "blur(6px)",
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div style={{ fontWeight: 900 }}>Geofence alert</div>
+            <button
+              onClick={() => setToastAlert(null)}
+              style={{
+                borderRadius: 10,
+                border: "1px solid rgba(255,255,255,0.10)",
+                background: "rgba(255,255,255,0.06)",
+                color: "#e5e7eb",
+                padding: "6px 10px",
+                cursor: "pointer",
+                fontSize: 12,
+                fontWeight: 900,
+              }}
+            >
+              Dismiss
+            </button>
+          </div>
+
+          <div style={{ marginTop: 8, fontSize: 13, lineHeight: 1.35 }}>{toastAlert.message}</div>
+          <div style={{ marginTop: 8, fontSize: 11, color: "#94a3b8" }}>
+            {new Date(toastAlert.createdAt ?? Date.now()).toLocaleString()}
+          </div>
+        </div>
+      ) : null}
+
       {/* Sidebar */}
       <div
         style={{
@@ -743,6 +814,9 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             </div>
           )}
         </div>
+
+        {/* Alerts */}
+        <AlertsPanel token={token} incomingAlert={incomingAlert} />
 
         {/* Claimed devices */}
         <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>Devices</div>
