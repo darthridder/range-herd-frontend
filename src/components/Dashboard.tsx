@@ -10,6 +10,7 @@ import {
   Marker,
   Popup,
   Circle,
+  Polyline,
   Polygon,
   Tooltip,
   FeatureGroup,
@@ -901,7 +902,31 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+          {/* ───────────── Geofences (Property Boundary + others) ───────────── */}
+{geofences?.map((gf: any) => {
+  // Circle fences
+  if (
+    gf.type === "circle" &&
+    gf.centerLat != null &&
+    gf.centerLon != null &&
+    gf.radiusM != null
+  ) {
+    return (
+      <Circle
+        key={gf.id}
+        center={[gf.centerLat, gf.centerLon]}
+        radius={gf.radiusM}
+      />
+    );
+  }
 
+  // Polygon fences stored as GeoJSON geometry (Polygon or MultiPolygon)
+  if (gf.type === "polygon" && gf.polygon?.type && gf.polygon?.coordinates) {
+    return <GeoJSON key={gf.id} data={gf.polygon} />;
+  }
+
+  return null;
+})}
           <FeatureGroup>
             <EditControl
               position="topright"
