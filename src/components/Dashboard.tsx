@@ -11,9 +11,10 @@ import {
   Popup,
   Circle,
   Polyline,
-  Polygon,
   Tooltip,
   FeatureGroup,
+  GeoJSON,
+  useMap,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -54,12 +55,7 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
-
-  // Can be:
-  // - GeoJSON Geometry: { type:"Polygon"|"MultiPolygon", coordinates: ... }
-  // - Legacy array formats: [[lat,lon], ...] or [{lat,lon}, ...]
   polygon: any;
-
   createdAt?: string;
 };
 
@@ -125,97 +121,72 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-/* ============================================================
-   GEOFENCE HELPERS
-   - Supports GeoJSON Polygon/MultiPolygon geometry objects
-   - Supports legacy array formats
-============================================================ */
-
-// Legacy: [[lat,lon], ...] or [{lat,lon}, ...]
-function coerceLegacyPolygonLatLngs(polygon: any): [number, number][] | null {
-  if (!polygon) return null;
-
-  // [[lat, lon], ...]
-  if (Array.isArray(polygon) && polygon.length > 0 && Array.isArray(polygon[0])) {
-    const first = polygon[0];
-    if (typeof first[0] === "number" && typeof first[1] === "number") {
-      return polygon
-        .map((pair: any) => [Number(pair[0]), Number(pair[1])] as [number, number])
-        .filter((p: any) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-    }
-  }
-
-  // [{lat, lon}, ...]
-  if (Array.isArray(polygon) && polygon.length > 0 && typeof polygon[0] === "object") {
-    const pt = polygon[0];
-    if (pt?.lat != null && pt?.lon != null) {
-      return (polygon as any[])
-        .map((x: any) => [Number(x.lat), Number(x.lon)] as [number, number])
-        .filter((p: any) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
-    }
-  }
-
-  return null;
-}
-
-// Convert GeoJSON geometry to react-leaflet Polygon "positions"
-// Polygon:    [ [ [lon,lat], ... ] , holes... ]
-// MultiPolygon: [ [ [ [lon,lat], ... ] , holes... ], ... ]
-function geoJsonGeometryToPositions(geom: any): any | null {
-  if (!geom || typeof geom !== "object") return null;
-
-  const t = String(geom.type ?? "");
-  const coords = geom.coordinates;
-
-  const swap = (pt: any): [number, number] | null => {
-    // Expect [lon,lat] or [lon,lat,alt...]
-    if (!Array.isArray(pt) || pt.length < 2) return null;
-    const lon = Number(pt[0]);
-    const lat = Number(pt[1]);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    return [lat, lon];
-  };
-
-  if (t === "Polygon") {
-    if (!Array.isArray(coords)) return null;
-    const rings = coords
-      .map((ring: any) => (Array.isArray(ring) ? ring.map(swap).filter(Boolean) : []))
-      .filter((ring: any) => ring.length >= 3);
-    if (rings.length === 0) return null;
-
-    // react-leaflet Polygon supports: LatLngExpression[] | LatLngExpression[][]
-    // If multiple rings (holes), pass array of rings
-    return rings.length === 1 ? rings[0] : rings;
-  }
-
-  if (t === "MultiPolygon") {
-    if (!Array.isArray(coords)) return null;
-    const polys = coords
-      .map((poly: any) => {
-        if (!Array.isArray(poly)) return null;
-        const rings = poly
-          .map((ring: any) => (Array.isArray(ring) ? ring.map(swap).filter(Boolean) : []))
-          .filter((ring: any) => ring.length >= 3);
-        if (rings.length === 0) return null;
-        return rings.length === 1 ? rings[0] : rings;
-      })
-      .filter(Boolean);
-
-    if (polys.length === 0) return null;
-
-    // react-leaflet Polygon supports multipolygon as LatLngExpression[][][]
-    return polys;
-  }
-
-  return null;
-}
-
+// Convert leaflet polygon latlngs => DB format [[lat,lon],...]
 function polygonLatLngsToDb(latlngs: any): [number, number][] {
   const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
   if (!Array.isArray(ring)) return [];
   return ring
     .map((p: any) => [Number(p.lat), Number(p.lng)] as [number, number])
     .filter((pair: any) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
+}
+
+// ----- GeoJSON helpers (for polygon fences) -----
+function toFeatureFromGeometry(geometry: any, props: Record<string, any>) {
+  return {
+    type: "Feature" as const,
+    properties: props,
+    geometry,
+  };
+}
+
+function isGeoJsonGeometry(obj: any): boolean {
+  return !!obj && typeof obj === "object" && typeof obj.type === "string" && obj.coordinates;
+}
+
+/**
+ * Leaflet expects coordsToLatLng to receive [lng,lat] (GeoJSON order).
+ * We convert to L.latLng(lat,lng).
+ */
+function coordsToLatLng(coords: any) {
+  const lng = Number(coords?.[0]);
+  const lat = Number(coords?.[1]);
+  return L.latLng(lat, lng);
+}
+
+/**
+ * Small helper component: once geofences load, auto-fit to the property boundary
+ * so you can *see it immediately*.
+ */
+function FitToGeofence({ geofences }: { geofences: Geofence[] }) {
+  const map = useMap();
+  const didFitRef = useRef(false);
+
+  useEffect(() => {
+    if (didFitRef.current) return;
+    if (!geofences || geofences.length === 0) return;
+
+    // Prefer the fence named "Property Boundary" if it exists, else first polygon fence.
+    const target =
+      geofences.find((g) => (g.name || "").toLowerCase().includes("property")) ??
+      geofences.find((g) => g.type === "polygon" && isGeoJsonGeometry(g.polygon));
+
+    if (!target) return;
+    if (target.type !== "polygon" || !isGeoJsonGeometry(target.polygon)) return;
+
+    try {
+      const feature = toFeatureFromGeometry(target.polygon, { id: target.id, name: target.name });
+      const layer = L.geoJSON(feature as any, { coordsToLatLng });
+      const bounds = layer.getBounds();
+      if (bounds && bounds.isValid()) {
+        didFitRef.current = true;
+        map.fitBounds(bounds, { padding: [40, 40] });
+      }
+    } catch (e) {
+      console.warn("fitBounds failed", e);
+    }
+  }, [geofences, map]);
+
+  return null;
 }
 
 export default function Dashboard({ token, user, onLogout }: DashboardProps) {
@@ -419,14 +390,20 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const coords = polygonLatLngsToDb(latlngs);
 
         if (coords.length >= 3) {
-          // Keep legacy array format for drawn polygons (works with backend too)
+          // Store polygons drawn on the map as a GeoJSON Polygon geometry
+          const geojsonGeom = {
+            type: "Polygon",
+            // GeoJSON is [lng,lat], so convert from DB [lat,lon]
+            coordinates: [[...coords.map(([lat, lon]) => [lon, lat]), [coords[0][1], coords[0][0]]]],
+          };
+
           await createGeofence({
             name: `Polygon ${new Date().toLocaleTimeString()}`,
             type: "polygon",
             centerLat: null,
             centerLon: null,
             radiusM: null,
-            polygon: coords,
+            polygon: geojsonGeom,
           });
         }
       }
@@ -471,7 +448,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // WebSocket connect
+  // WebSocket connect (no self reference)
   useEffect(() => {
     let stopped = false;
 
@@ -794,9 +771,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
               <input type="checkbox" checked={showGeofences} onChange={(e) => setShowGeofences(e.target.checked)} />
-              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>
-                Show ({geofences.length})
-              </span>
+              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>Show ({geofences.length})</span>
             </label>
           </div>
 
@@ -858,7 +833,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
               ) : null}
             </div>
           ) : (
-            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>No geofences yet. Use the draw tools.</div>
+            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>No geofences yet. Use the draw tools on the map.</div>
           )}
         </div>
 
@@ -956,7 +931,56 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* Draw tools */}
+          {/* Auto-zoom to property boundary once */}
+          <FitToGeofence geofences={geofences} />
+
+          {/* Render geofences */}
+          {showGeofences
+            ? geofences.map((gf) => {
+                // Circle fences
+                if (
+                  gf.type === "circle" &&
+                  gf.centerLat != null &&
+                  gf.centerLon != null &&
+                  gf.radiusM != null
+                ) {
+                  return (
+                    <Circle
+                      key={gf.id}
+                      center={[gf.centerLat, gf.centerLon]}
+                      radius={gf.radiusM}
+                      pathOptions={{ weight: 2 }}
+                    >
+                      <Tooltip sticky>{gf.name}</Tooltip>
+                    </Circle>
+                  );
+                }
+
+                // Polygon/MultiPolygon fences stored as GeoJSON geometry
+                if (gf.type === "polygon" && isGeoJsonGeometry(gf.polygon)) {
+                  const feature = toFeatureFromGeometry(gf.polygon, { id: gf.id, name: gf.name });
+
+                  return (
+                    <GeoJSON
+                      key={gf.id}
+                      data={feature as any}
+                      coordsToLatLng={coordsToLatLng as any}
+                      style={() => ({
+                        weight: 3,
+                        opacity: 0.9,
+                        fillOpacity: 0.15,
+                      })}
+                      onEachFeature={(_, layer) => {
+                        layer.bindTooltip(gf.name, { sticky: true });
+                      }}
+                    />
+                  );
+                }
+
+                return null;
+              })
+            : null}
+
           <FeatureGroup>
             <EditControl
               position="topright"
@@ -966,47 +990,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             />
           </FeatureGroup>
 
-          {/* Geofences */}
-          {showGeofences
-            ? geofences.map((g) => {
-                if (g.type === "circle") {
-                  if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
-                  return (
-                    <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
-                      <Tooltip sticky>{g.name}</Tooltip>
-                    </Circle>
-                  );
-                }
-
-                if (g.type === "polygon") {
-                  // Prefer GeoJSON geometry if present
-                  const positionsFromGeo = geoJsonGeometryToPositions(g.polygon);
-                  if (positionsFromGeo) {
-                    return (
-                      <Polygon key={g.id} positions={positionsFromGeo as any} pathOptions={{ weight: 2 }}>
-                        <Tooltip sticky>{g.name}</Tooltip>
-                      </Polygon>
-                    );
-                  }
-
-                  // Fallback: legacy array formats
-                  const legacy = coerceLegacyPolygonLatLngs(g.polygon);
-                  if (legacy && legacy.length >= 3) {
-                    return (
-                      <Polygon key={g.id} positions={legacy} pathOptions={{ weight: 2 }}>
-                        <Tooltip sticky>{g.name}</Tooltip>
-                      </Polygon>
-                    );
-                  }
-
-                  return null;
-                }
-
-                return null;
-              })
-            : null}
-
-          {/* Devices */}
+          {/* Device markers */}
           {devices.map((d) => {
             const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
