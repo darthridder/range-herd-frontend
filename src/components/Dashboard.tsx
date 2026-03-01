@@ -54,7 +54,7 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
-  polygon: any; // stored as GeoJSON geometry for polygons (Polygon/MultiPolygon)
+  polygon: any;
   createdAt?: string;
 };
 
@@ -123,6 +123,7 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
+/** Convert a Leaflet polygon latlngs to DB format (array of [lat, lon]) */
 function polygonLatLngsToDb(latlngs: any): [number, number][] {
   const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
   if (!Array.isArray(ring)) return [];
@@ -131,35 +132,87 @@ function polygonLatLngsToDb(latlngs: any): [number, number][] {
     .filter((pair: any) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
 }
 
-/** Guard: if geometry has any weird coordinate, don’t let it crash Leaflet */
-function firstLonLatFromGeometry(geom: any): [number, number] | null {
-  if (!geom || typeof geom !== "object") return null;
-  const t = String(geom.type || "");
+/** Ensure first==last in GeoJSON ring */
+function closeRingLonLat(ring: [number, number][]): [number, number][] {
+  if (ring.length < 3) return ring;
+  const first = ring[0];
+  const last = ring[ring.length - 1];
+  if (first[0] === last[0] && first[1] === last[1]) return ring;
+  return [...ring, first];
+}
+
+/** Validate lon/lat pair */
+function isFiniteLonLat(pair: any) {
+  if (!Array.isArray(pair) || pair.length < 2) return false;
+  const lon = Number(pair[0]);
+  const lat = Number(pair[1]);
+  return Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90;
+}
+
+/** Walk GeoJSON coordinates and confirm they are all finite lon/lat pairs */
+function validateGeoJsonGeometry(geom: any): boolean {
+  if (!geom || typeof geom !== "object") return false;
+  const t = geom.type;
   const c = geom.coordinates;
 
-  try {
-    if (t === "Polygon") {
-      const p = c?.[0]?.[0];
-      if (Array.isArray(p) && p.length >= 2) return [Number(p[0]), Number(p[1])];
+  if (!t || c == null) return false;
+
+  // Point: [lon,lat]
+  if (t === "Point") return isFiniteLonLat(c);
+
+  // LineString: [[lon,lat],...]
+  if (t === "LineString") return Array.isArray(c) && c.every(isFiniteLonLat);
+
+  // Polygon: [[[lon,lat],...], ...rings]
+  if (t === "Polygon")
+    return Array.isArray(c) && c.every((ring: any) => Array.isArray(ring) && ring.every(isFiniteLonLat));
+
+  // MultiPolygon: [[[[lon,lat],...]], ...polys]
+  if (t === "MultiPolygon")
+    return (
+      Array.isArray(c) &&
+      c.every(
+        (poly: any) =>
+          Array.isArray(poly) &&
+          poly.every((ring: any) => Array.isArray(ring) && ring.every(isFiniteLonLat))
+      )
+    );
+
+  return false;
+}
+
+/**
+ * Normalize geofence polygon storage into a GeoJSON Geometry:
+ * - If it's already GeoJSON (Polygon/MultiPolygon), keep it.
+ * - If it's legacy DB format [[lat,lon],...], convert to GeoJSON Polygon coords [[ [lon,lat], ... ]]
+ */
+function geofencePolygonToGeoJsonGeometry(p: any): any | null {
+  if (!p) return null;
+
+  // Already GeoJSON Geometry
+  if (typeof p === "object" && p.type && p.coordinates) {
+    if (p.type === "Polygon" || p.type === "MultiPolygon") {
+      return validateGeoJsonGeometry(p) ? p : null;
     }
-    if (t === "MultiPolygon") {
-      const p = c?.[0]?.[0]?.[0];
-      if (Array.isArray(p) && p.length >= 2) return [Number(p[0]), Number(p[1])];
+  }
+
+  // Legacy: array of pairs [lat, lon]
+  if (Array.isArray(p) && p.length > 0 && Array.isArray(p[0])) {
+    const first = p[0];
+    if (typeof first[0] === "number" && typeof first[1] === "number") {
+      // interpret as [lat,lon]
+      const ringLonLat = closeRingLonLat(
+        p
+          .map((pair: any) => [Number(pair[1]), Number(pair[0])] as [number, number]) // -> [lon,lat]
+          .filter(isFiniteLonLat)
+      );
+
+      const geom = { type: "Polygon", coordinates: [ringLonLat] };
+      return validateGeoJsonGeometry(geom) ? geom : null;
     }
-  } catch {
-    return null;
   }
 
   return null;
-}
-
-function isValidLonLatPair(pair: [number, number] | null): boolean {
-  if (!pair) return false;
-  const [lon, lat] = pair;
-  if (!Number.isFinite(lon) || !Number.isFinite(lat)) return false;
-  if (lon < -180 || lon > 180) return false;
-  if (lat < -90 || lat > 90) return false;
-  return true;
 }
 
 export default function Dashboard({ token, user, onLogout }: DashboardProps) {
@@ -363,21 +416,13 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const coords = polygonLatLngsToDb(latlngs);
 
         if (coords.length >= 3) {
-          // store as GeoJSON Polygon geometry (lon/lat required by GeoJSON)
-          const ringLonLat = coords.map(([lat, lon]) => [lon, lat]);
-          // close ring if needed
-          const first = ringLonLat[0];
-          const last = ringLonLat[ringLonLat.length - 1];
-          const closed =
-            first && last && (first[0] !== last[0] || first[1] !== last[1]) ? [...ringLonLat, first] : ringLonLat;
-
           await createGeofence({
             name: `Polygon ${new Date().toLocaleTimeString()}`,
             type: "polygon",
             centerLat: null,
             centerLon: null,
             radiusM: null,
-            polygon: { type: "Polygon", coordinates: [closed] },
+            polygon: coords, // legacy format [lat,lon] pairs (server accepts)
           });
         }
       }
@@ -744,8 +789,14 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input type="checkbox" checked={showGeofences} onChange={(e) => setShowGeofences(e.target.checked)} />
-              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>Show ({geofences.length})</span>
+              <input
+                type="checkbox"
+                checked={showGeofences}
+                onChange={(e) => setShowGeofences(e.target.checked)}
+              />
+              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>
+                Show ({geofences.length})
+              </span>
             </label>
           </div>
 
@@ -802,10 +853,14 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                   </button>
                 </div>
               ))}
-              {geofences.length > 10 ? <div style={{ fontSize: 11, color: "#94a3b8" }}>Showing 10 of {geofences.length}</div> : null}
+              {geofences.length > 10 ? (
+                <div style={{ fontSize: 11, color: "#94a3b8" }}>Showing 10 of {geofences.length}</div>
+              ) : null}
             </div>
           ) : (
-            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>No geofences yet. Use the draw tools on the map.</div>
+            <div style={{ marginTop: 10, fontSize: 12, color: "#94a3b8" }}>
+              No geofences yet. Use the draw tools on the map.
+            </div>
           )}
         </div>
 
@@ -854,11 +909,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt
-                          ? new Date(last.receivedAt).toLocaleTimeString()
-                          : d.lastSeen
-                          ? new Date(d.lastSeen).toLocaleTimeString()
-                          : "—"}
+                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
                       </div>
                     </div>
 
@@ -895,42 +946,63 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
       {/* Map */}
       <div style={{ flex: 1, position: "relative" }}>
         <MapContainer center={mapCenter} zoom={13} style={{ height: "100%", width: "100%" }}>
-          <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a>'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
 
-          {/* Geofences (single rendering path, guarded) */}
+          {/* ✅ Geofences (single render path; no duplicates) */}
           {showGeofences
-            ? geofences.map((g) => {
-                if (g.type === "circle") {
-                  if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
+            ? geofences.map((gf) => {
+                // Circles
+                if (gf.type === "circle" && gf.centerLat != null && gf.centerLon != null && gf.radiusM != null) {
                   return (
-                    <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
-                      <Tooltip sticky>{g.name}</Tooltip>
+                    <Circle
+                      key={gf.id}
+                      center={[gf.centerLat, gf.centerLon]}
+                      radius={gf.radiusM}
+                      pathOptions={{ weight: 2 }}
+                    >
+                      <Tooltip sticky>{gf.name}</Tooltip>
                     </Circle>
                   );
                 }
 
-                if (g.type === "polygon" && g.polygon?.type && g.polygon?.coordinates) {
-                  const first = firstLonLatFromGeometry(g.polygon);
-                  if (!isValidLonLatPair(first)) {
-                    console.warn("Skipping invalid polygon geofence:", g.id, g.name, g.polygon);
+                // Polygons: render via GeoJSON only (Polygon or MultiPolygon)
+                if (gf.type === "polygon") {
+                  const geom = geofencePolygonToGeoJsonGeometry(gf.polygon);
+
+                  if (!geom) {
+                    console.warn("⚠️ Skipping invalid polygon geofence:", gf.id, gf.name, gf.polygon);
                     return null;
                   }
 
                   const feature = {
                     type: "Feature",
-                    properties: { id: g.id, name: g.name },
-                    geometry: g.polygon,
+                    properties: { id: gf.id, name: gf.name },
+                    geometry: geom,
                   };
 
                   return (
                     <GeoJSON
-                      key={g.id}
+                      key={gf.id}
                       data={feature as any}
-                      style={() => ({ weight: 3 })}
-                      onEachFeature={(_f, layer) => {
-                        try {
-                          (layer as any).bindTooltip(g.name, { sticky: true });
-                        } catch {}
+                      // GeoJSON coordinates are [lon,lat] => Leaflet wants (lat,lon)
+                      coordsToLatLng={(coords: any) => {
+                        const lon = Number(coords?.[0]);
+                        const lat = Number(coords?.[1]);
+                        // Hard guard against NaN crashes
+                        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return L.latLng(0, 0);
+                        return L.latLng(lat, lon);
+                      }}
+                      style={() => ({
+                        weight: 3,
+                        opacity: 0.95,
+                        fillOpacity: 0.12,
+                      })}
+                      onEachFeature={(f, layer) => {
+                        const name = (f as any)?.properties?.name ?? "Geofence";
+                        layer.bindTooltip(String(name), { sticky: true });
                       }}
                     />
                   );
@@ -956,7 +1028,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             if (!p) return null;
 
             const motion = motionByDevice[id] ?? "unknown";
-            const color = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
+            const color =
+              motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
             const icon = createColoredIcon(color);
 
             return (
