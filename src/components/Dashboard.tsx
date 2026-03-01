@@ -11,9 +11,9 @@ import {
   Popup,
   Circle,
   Polyline,
+  Polygon,
   Tooltip,
   FeatureGroup,
-  GeoJSON,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
 
@@ -123,96 +123,99 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-/** Convert a Leaflet polygon latlngs to DB format (array of [lat, lon]) */
+/* ============================================================
+   ✅ Geofence polygon helpers (supports Polygon + MultiPolygon + old array format)
+============================================================ */
+
+function isFiniteNum(x: any) {
+  return typeof x === "number" && Number.isFinite(x);
+}
+
+// Detect whether a pair looks like [lat, lon] or [lon, lat]
+function normalizePairToLatLng(pair: any): [number, number] | null {
+  if (!Array.isArray(pair) || pair.length < 2) return null;
+
+  const a = Number(pair[0]);
+  const b = Number(pair[1]);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+
+  // If first number is outside valid latitude range, it's probably lon
+  // (lon can be [-180..180], lat must be [-90..90])
+  const looksLikeLonLat = Math.abs(a) > 90 && Math.abs(a) <= 180 && Math.abs(b) <= 90;
+  if (looksLikeLonLat) return [b, a]; // [lat, lon]
+
+  // Otherwise treat as [lat, lon] (your original saved polygon array format)
+  const looksLikeLatLon = Math.abs(a) <= 90 && Math.abs(b) <= 180;
+  if (looksLikeLatLon) return [a, b];
+
+  return null;
+}
+
+// Convert stored polygon (GeoJSON geometry OR old array) into react-leaflet <Polygon positions>
+function polygonToLeafletPositions(polygon: any): any | null {
+  if (!polygon) return null;
+
+  // 1) Old DB format: [[lat, lon], [lat, lon], ...]
+  if (Array.isArray(polygon) && polygon.length > 0) {
+    const first = normalizePairToLatLng(polygon[0]);
+    if (first) {
+      const ring = (polygon as any[])
+        .map((p) => normalizePairToLatLng(p))
+        .filter(Boolean) as [number, number][];
+      if (ring.length >= 3) return ring;
+    }
+  }
+
+  // 2) GeoJSON geometry object
+  if (typeof polygon === "object" && polygon?.type && polygon?.coordinates) {
+    const type = String(polygon.type);
+
+    if (type === "Polygon") {
+      const ring = polygon.coordinates?.[0];
+      if (!Array.isArray(ring)) return null;
+
+      const latlngs = ring
+        .map((p: any) => normalizePairToLatLng(p))
+        .filter(Boolean) as [number, number][];
+
+      if (latlngs.length >= 3) return latlngs;
+      return null;
+    }
+
+    if (type === "MultiPolygon") {
+      const polys = polygon.coordinates;
+      if (!Array.isArray(polys) || polys.length === 0) return null;
+
+      // MultiPolygon => [ [ [ [lon,lat], ... ] ] , ... ]
+      const out = polys
+        .map((poly: any) => {
+          const rings = Array.isArray(poly) ? poly : [];
+          return rings
+            .map((ring: any) => {
+              const pts = Array.isArray(ring) ? ring : [];
+              const latlngs = pts
+                .map((p: any) => normalizePairToLatLng(p))
+                .filter(Boolean) as [number, number][];
+              return latlngs.length >= 3 ? latlngs : null;
+            })
+            .filter(Boolean);
+        })
+        .filter((rings: any) => rings && rings.length > 0);
+
+      if (out.length > 0) return out; // react-leaflet Polygon can take nested arrays
+      return null;
+    }
+  }
+
+  return null;
+}
+
 function polygonLatLngsToDb(latlngs: any): [number, number][] {
   const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
   if (!Array.isArray(ring)) return [];
   return ring
     .map((p: any) => [Number(p.lat), Number(p.lng)] as [number, number])
-    .filter((pair: any) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
-}
-
-/** Ensure first==last in GeoJSON ring */
-function closeRingLonLat(ring: [number, number][]): [number, number][] {
-  if (ring.length < 3) return ring;
-  const first = ring[0];
-  const last = ring[ring.length - 1];
-  if (first[0] === last[0] && first[1] === last[1]) return ring;
-  return [...ring, first];
-}
-
-/** Validate lon/lat pair */
-function isFiniteLonLat(pair: any) {
-  if (!Array.isArray(pair) || pair.length < 2) return false;
-  const lon = Number(pair[0]);
-  const lat = Number(pair[1]);
-  return Number.isFinite(lon) && Number.isFinite(lat) && lon >= -180 && lon <= 180 && lat >= -90 && lat <= 90;
-}
-
-/** Walk GeoJSON coordinates and confirm they are all finite lon/lat pairs */
-function validateGeoJsonGeometry(geom: any): boolean {
-  if (!geom || typeof geom !== "object") return false;
-  const t = geom.type;
-  const c = geom.coordinates;
-
-  if (!t || c == null) return false;
-
-  // Point: [lon,lat]
-  if (t === "Point") return isFiniteLonLat(c);
-
-  // LineString: [[lon,lat],...]
-  if (t === "LineString") return Array.isArray(c) && c.every(isFiniteLonLat);
-
-  // Polygon: [[[lon,lat],...], ...rings]
-  if (t === "Polygon")
-    return Array.isArray(c) && c.every((ring: any) => Array.isArray(ring) && ring.every(isFiniteLonLat));
-
-  // MultiPolygon: [[[[lon,lat],...]], ...polys]
-  if (t === "MultiPolygon")
-    return (
-      Array.isArray(c) &&
-      c.every(
-        (poly: any) =>
-          Array.isArray(poly) &&
-          poly.every((ring: any) => Array.isArray(ring) && ring.every(isFiniteLonLat))
-      )
-    );
-
-  return false;
-}
-
-/**
- * Normalize geofence polygon storage into a GeoJSON Geometry:
- * - If it's already GeoJSON (Polygon/MultiPolygon), keep it.
- * - If it's legacy DB format [[lat,lon],...], convert to GeoJSON Polygon coords [[ [lon,lat], ... ]]
- */
-function geofencePolygonToGeoJsonGeometry(p: any): any | null {
-  if (!p) return null;
-
-  // Already GeoJSON Geometry
-  if (typeof p === "object" && p.type && p.coordinates) {
-    if (p.type === "Polygon" || p.type === "MultiPolygon") {
-      return validateGeoJsonGeometry(p) ? p : null;
-    }
-  }
-
-  // Legacy: array of pairs [lat, lon]
-  if (Array.isArray(p) && p.length > 0 && Array.isArray(p[0])) {
-    const first = p[0];
-    if (typeof first[0] === "number" && typeof first[1] === "number") {
-      // interpret as [lat,lon]
-      const ringLonLat = closeRingLonLat(
-        p
-          .map((pair: any) => [Number(pair[1]), Number(pair[0])] as [number, number]) // -> [lon,lat]
-          .filter(isFiniteLonLat)
-      );
-
-      const geom = { type: "Polygon", coordinates: [ringLonLat] };
-      return validateGeoJsonGeometry(geom) ? geom : null;
-    }
-  }
-
-  return null;
+    .filter((pair: any) => isFiniteNum(pair[0]) && isFiniteNum(pair[1]));
 }
 
 export default function Dashboard({ token, user, onLogout }: DashboardProps) {
@@ -422,7 +425,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             centerLat: null,
             centerLon: null,
             radiusM: null,
-            polygon: coords, // legacy format [lat,lon] pairs (server accepts)
+            polygon: coords, // keep old format for drawn polygons
           });
         }
       }
@@ -467,7 +470,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // WebSocket connect (no self reference)
+  // WebSocket connect
   useEffect(() => {
     let stopped = false;
 
@@ -909,7 +912,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
+                        {last?.receivedAt
+                          ? new Date(last.receivedAt).toLocaleTimeString()
+                          : d.lastSeen
+                          ? new Date(d.lastSeen).toLocaleTimeString()
+                          : "—"}
                       </div>
                     </div>
 
@@ -951,67 +958,6 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {/* ✅ Geofences (single render path; no duplicates) */}
-          {showGeofences
-            ? geofences.map((gf) => {
-                // Circles
-                if (gf.type === "circle" && gf.centerLat != null && gf.centerLon != null && gf.radiusM != null) {
-                  return (
-                    <Circle
-                      key={gf.id}
-                      center={[gf.centerLat, gf.centerLon]}
-                      radius={gf.radiusM}
-                      pathOptions={{ weight: 2 }}
-                    >
-                      <Tooltip sticky>{gf.name}</Tooltip>
-                    </Circle>
-                  );
-                }
-
-                // Polygons: render via GeoJSON only (Polygon or MultiPolygon)
-                if (gf.type === "polygon") {
-                  const geom = geofencePolygonToGeoJsonGeometry(gf.polygon);
-
-                  if (!geom) {
-                    console.warn("⚠️ Skipping invalid polygon geofence:", gf.id, gf.name, gf.polygon);
-                    return null;
-                  }
-
-                  const feature = {
-                    type: "Feature",
-                    properties: { id: gf.id, name: gf.name },
-                    geometry: geom,
-                  };
-
-                  return (
-                    <GeoJSON
-                      key={gf.id}
-                      data={feature as any}
-                      // GeoJSON coordinates are [lon,lat] => Leaflet wants (lat,lon)
-                      coordsToLatLng={(coords: any) => {
-                        const lon = Number(coords?.[0]);
-                        const lat = Number(coords?.[1]);
-                        // Hard guard against NaN crashes
-                        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return L.latLng(0, 0);
-                        return L.latLng(lat, lon);
-                      }}
-                      style={() => ({
-                        weight: 3,
-                        opacity: 0.95,
-                        fillOpacity: 0.12,
-                      })}
-                      onEachFeature={(f, layer) => {
-                        const name = (f as any)?.properties?.name ?? "Geofence";
-                        layer.bindTooltip(String(name), { sticky: true });
-                      }}
-                    />
-                  );
-                }
-
-                return null;
-              })
-            : null}
-
           <FeatureGroup>
             <EditControl
               position="topright"
@@ -1021,6 +967,37 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             />
           </FeatureGroup>
 
+          {/* ✅ Geofences */}
+          {showGeofences
+            ? geofences.map((g) => {
+                if (g.type === "circle") {
+                  if (g.centerLat == null || g.centerLon == null || g.radiusM == null) return null;
+                  return (
+                    <Circle key={g.id} center={[g.centerLat, g.centerLon]} radius={g.radiusM} pathOptions={{ weight: 2 }}>
+                      <Tooltip sticky>{g.name}</Tooltip>
+                    </Circle>
+                  );
+                }
+
+                if (g.type === "polygon") {
+                  const positions = polygonToLeafletPositions(g.polygon);
+                  if (!positions) {
+                    console.warn("Skipping invalid polygon geofence:", g.id, g.name, g.polygon);
+                    return null;
+                  }
+
+                  return (
+                    <Polygon key={g.id} positions={positions as any} pathOptions={{ weight: 2 }}>
+                      <Tooltip sticky>{g.name}</Tooltip>
+                    </Polygon>
+                  );
+                }
+
+                return null;
+              })
+            : null}
+
+          {/* Devices */}
           {devices.map((d) => {
             const id = d.deviceId;
             const pts = pointsByDevice[id] || [];
