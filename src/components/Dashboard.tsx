@@ -54,8 +54,7 @@ type Geofence = {
   centerLat: number | null;
   centerLon: number | null;
   radiusM: number | null;
-  // stored as GeoJSON geometry object for polygons
-  polygon: any;
+  polygon: any; // GeoJSON geometry expected for polygon type
   createdAt?: string;
 };
 
@@ -95,9 +94,6 @@ function createColoredIcon(color: string) {
 
 /**
  * Motion detection tuning:
- * - Increase threshold to beat GPS drift
- * - Require recent points
- * - Require reasonable speed (distance / time)
  */
 const MOVEMENT_THRESHOLD_M = 25;
 const RECENT_WINDOW_MS = 5 * 60_000;
@@ -124,7 +120,10 @@ function haversineMeters(a: { lat: number; lon: number }, b: { lat: number; lon:
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-/** Convert leaflet polygon latlngs to DB ring as [lat, lon] pairs (used only for drawn polygons) */
+/**
+ * Convert drawn Leaflet polygon -> DB shape (array of [lat, lon])
+ * (Your backend can normalize; leaving as-is to match your original behavior)
+ */
 function polygonLatLngsToDb(latlngs: any): [number, number][] {
   const ring = Array.isArray(latlngs?.[0]) ? latlngs[0] : latlngs;
   if (!Array.isArray(ring)) return [];
@@ -133,19 +132,48 @@ function polygonLatLngsToDb(latlngs: any): [number, number][] {
     .filter((pair: any) => Number.isFinite(pair[0]) && Number.isFinite(pair[1]));
 }
 
-/** Guard: only accept valid GeoJSON Polygon/MultiPolygon geometries */
+/**
+ * Robust GeoJSON polygon validator (Polygon + MultiPolygon).
+ * Prevents Leaflet crashes by rejecting weird coordinate shapes (bbox / NaN / etc).
+ */
 function isValidGeoJsonPolygonGeometry(geom: any): boolean {
   if (!geom || typeof geom !== "object") return false;
-  if (geom.type !== "Polygon" && geom.type !== "MultiPolygon") return false;
-  if (!Array.isArray(geom.coordinates)) return false;
-  return true;
+
+  const t = geom.type;
+  const coords = geom.coordinates;
+
+  if (t !== "Polygon" && t !== "MultiPolygon") return false;
+  if (!Array.isArray(coords)) return false;
+
+  // Validate a single [lng,lat] coordinate pair
+  const isCoord = (c: any) =>
+    Array.isArray(c) &&
+    c.length >= 2 &&
+    Number.isFinite(Number(c[0])) &&
+    Number.isFinite(Number(c[1])) &&
+    Math.abs(Number(c[0])) <= 180 &&
+    Math.abs(Number(c[1])) <= 90;
+
+  if (t === "Polygon") {
+    // coords: [ ring1, ring2... ], ring: [ [lng,lat], ... ]
+    if (!Array.isArray(coords[0])) return false;
+    const ring = coords[0];
+    if (!Array.isArray(ring) || ring.length < 4) return false;
+    return ring.every(isCoord);
+  }
+
+  // MultiPolygon: [ polygon1, polygon2... ], polygon: [ ring1, ring2... ]
+  if (!Array.isArray(coords[0]) || !Array.isArray(coords[0][0])) return false;
+  const firstPoly = coords[0];
+  const firstRing = firstPoly?.[0];
+  if (!Array.isArray(firstRing) || firstRing.length < 4) return false;
+  return firstRing.every(isCoord);
 }
 
-/** Create a GeoJSON Feature from a polygon geofence (safe + tooltip-ready) */
 function geofenceToFeature(gf: Geofence) {
   return {
-    type: "Feature" as const,
-    properties: { id: gf.id, name: gf.name },
+    type: "Feature",
+    properties: { id: gf.id, name: gf.name, type: gf.type },
     geometry: gf.polygon,
   };
 }
@@ -351,21 +379,13 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
         const coords = polygonLatLngsToDb(latlngs);
 
         if (coords.length >= 3) {
-          // store as GeoJSON Polygon geometry in DB
-          const geo = {
-            type: "Polygon",
-            coordinates: [
-              coords.map(([lat, lon]) => [lon, lat]), // GeoJSON requires [lon, lat]
-            ],
-          };
-
           await createGeofence({
             name: `Polygon ${new Date().toLocaleTimeString()}`,
             type: "polygon",
             centerLat: null,
             centerLon: null,
             radiusM: null,
-            polygon: geo,
+            polygon: coords, // backend should normalize to GeoJSON geometry
           });
         }
       }
@@ -410,7 +430,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
     };
   }, [loadDevices, loadUnclaimed, loadLatestPoints, loadGeofences]);
 
-  // WebSocket connect (no self reference)
+  // WebSocket connect
   useEffect(() => {
     let stopped = false;
 
@@ -440,6 +460,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             if (typeof raw === "string") {
               try {
                 const msg = JSON.parse(raw);
+
                 if (msg?.type === "alert" && msg?.data) {
                   const a = msg.data as AlertRow;
                   setIncomingAlert(a);
@@ -448,17 +469,13 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     setToastAlert((cur) => (cur?.id === a.id ? null : cur));
                   }, 8000);
                 }
-              } catch {
-                // ignore parse errors
-              }
+              } catch {}
             }
 
             await loadLatestPoints();
             await loadDevices();
             await loadUnclaimed();
-          } catch {
-            // ignore
-          }
+          } catch {}
         };
 
         ws.onerror = () => {
@@ -731,14 +748,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             </div>
 
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
-              <input
-                type="checkbox"
-                checked={showGeofences}
-                onChange={(e) => setShowGeofences(e.target.checked)}
-              />
-              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>
-                Show ({geofences.length})
-              </span>
+              <input type="checkbox" checked={showGeofences} onChange={(e) => setShowGeofences(e.target.checked)} />
+              <span style={{ fontSize: 12, fontWeight: 800, color: "#e5e7eb" }}>Show ({geofences.length})</span>
             </label>
           </div>
 
@@ -835,7 +846,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     width: "100%",
                     textAlign: "left",
                     borderRadius: 12,
-                    border: selectedDevice === id ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
+                    border:
+                      selectedDevice === id ? "1px solid rgba(34,197,94,0.9)" : "1px solid rgba(255,255,255,0.08)",
                     background: "rgba(255,255,255,0.03)",
                     padding: 10,
                     cursor: "pointer",
@@ -851,7 +863,11 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                     <div>
                       <div style={{ color: "#6b7280", fontSize: 11 }}>Last</div>
                       <div style={{ color: "#e5e7eb", fontSize: 11 }}>
-                        {last?.receivedAt ? new Date(last.receivedAt).toLocaleTimeString() : d.lastSeen ? new Date(d.lastSeen).toLocaleTimeString() : "—"}
+                        {last?.receivedAt
+                          ? new Date(last.receivedAt).toLocaleTimeString()
+                          : d.lastSeen
+                          ? new Date(d.lastSeen).toLocaleTimeString()
+                          : "—"}
                       </div>
                     </div>
 
@@ -895,7 +911,8 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
 
           {/* Geofences (ONE render path; no duplicates) */}
           {showGeofences
-            ? geofences.map((gf) => {
+            ? geofences.map((gf: any) => {
+                // circle
                 if (
                   gf.type === "circle" &&
                   gf.centerLat != null &&
@@ -903,19 +920,21 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
                   gf.radiusM != null
                 ) {
                   return (
-                    <Circle
-                      key={gf.id}
-                      center={[gf.centerLat, gf.centerLon]}
-                      radius={gf.radiusM}
-                      pathOptions={{ weight: 2 }}
-                    >
+                    <Circle key={gf.id} center={[gf.centerLat, gf.centerLon]} radius={gf.radiusM} pathOptions={{ weight: 2 }}>
                       <Tooltip sticky>{gf.name}</Tooltip>
                     </Circle>
                   );
                 }
 
-                if (gf.type === "polygon" && isValidGeoJsonPolygonGeometry(gf.polygon)) {
+                // polygon via GeoJSON (Polygon or MultiPolygon)
+                if (gf.type === "polygon") {
+                  if (!isValidGeoJsonPolygonGeometry(gf.polygon)) {
+                    console.warn("Skipping invalid polygon geofence:", gf?.id, gf?.name, gf?.polygon);
+                    return null;
+                  }
+
                   const feature = geofenceToFeature(gf);
+
                   return (
                     <GeoJSON
                       key={gf.id}
@@ -949,8 +968,7 @@ export default function Dashboard({ token, user, onLogout }: DashboardProps) {
             if (!p) return null;
 
             const motion = motionByDevice[id] ?? "unknown";
-            const color =
-              motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
+            const color = motion === "moving" ? "#22c55e" : motion === "stationary" ? "#93c5fd" : "#9ca3af";
             const icon = createColoredIcon(color);
 
             return (
